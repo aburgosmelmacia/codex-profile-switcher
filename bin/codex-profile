@@ -47,7 +47,7 @@ Commands:
       Print the CODEX_HOME directory for a profile.
 
   login <profile>
-      Run 'codex login' using that profile's CODEX_HOME.
+      Run 'codex login --device-auth' using that profile's CODEX_HOME.
 
   status [profile]
       Show 'codex login status' for a profile.
@@ -218,7 +218,7 @@ command_login() {
   dir="$(profile_dir "$profile")"
 
   note "Using CODEX_HOME=$dir"
-  CODEX_HOME="$dir" "$CODEX_BIN" login
+  CODEX_HOME="$dir" "$CODEX_BIN" login --device-auth
 }
 
 command_status() {

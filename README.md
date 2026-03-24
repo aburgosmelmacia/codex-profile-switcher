@@ -11,6 +11,8 @@ each account keeps its own:
 - cached state
 - config
 
+The `login` command in this tool always uses Codex device auth.
+
 ## Why this approach
 
 The simplest community tools often swap `auth.json` snapshots. That works, but it
@@ -40,6 +42,12 @@ Login once per account:
 ```bash
 codex-profile login personal
 codex-profile login work
+```
+
+Under the hood, those commands run:
+
+```bash
+CODEX_HOME=~/.codex-profiles/<profile> codex login --device-auth
 ```
 
 Optionally set a default profile:
@@ -91,6 +99,7 @@ codex-profile <profile> [-- <codex args...>]
 - Profiles are stored in `~/.codex-profiles`.
 - On first use, the tool copies `~/.codex/config.toml` into the new profile if it exists.
 - Profile names accept letters, numbers, dots, dashes, and underscores.
+- `codex-profile login <profile>` always uses `codex login --device-auth`.
 - This tool does not modify a running Codex process. If you already have a Codex session open, start a new one with the desired profile.
 
 ## Security
