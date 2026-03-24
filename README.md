@@ -136,6 +136,7 @@ Explicit profile runs such as `codex-profile melmacia2` do not auto-switch away.
 
 ```text
 codex-profile list
+codex-profile limits
 codex-profile current
 codex-profile use <profile>
 codex-profile path <profile>
@@ -153,6 +154,7 @@ codex-profile <profile> [-- <codex args...>]
 
 - Saved auth profiles are stored in `~/.codex/.codex-profile/accounts`.
 - Cached per-profile limits are stored in `~/.codex/.codex-profile/limits`.
+- `codex-profile limits` shows the last known weekly/5-hour values per profile.
 - The live auth file remains `~/.codex/auth.json`.
 - Auto-switch config is stored in `~/.codex/.codex-profile/config.toml`.
 - Profile names accept letters, numbers, dots, dashes, and underscores.

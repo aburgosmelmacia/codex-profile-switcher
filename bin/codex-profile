@@ -54,6 +54,7 @@ $PROGRAM - shared-session profile manager for Codex accounts
 Usage:
   $PROGRAM help
   $PROGRAM list
+  $PROGRAM limits
   $PROGRAM current
   $PROGRAM use <profile>
   $PROGRAM path <profile>
@@ -69,6 +70,9 @@ Usage:
 Commands:
   list
       List saved auth profiles from $ACCOUNTS_HOME.
+
+  limits
+      Show the last known weekly and 5-hour limits cached for each saved profile.
 
   current
       Show the default profile.
@@ -118,6 +122,7 @@ Commands:
 Examples:
   $PROGRAM save melmacia1
   $PROGRAM login melmacia2
+  $PROGRAM limits
   $PROGRAM config tui
   $PROGRAM config set auto_switch.enabled true
   $PROGRAM config set auto_switch.weekly_threshold_percent 20
@@ -853,6 +858,61 @@ command_list() {
   fi
 }
 
+command_limits() {
+  ensure_dirs
+
+  local default_profile live_profile found=0
+  local profile weekly five_hour observed_at tags status_text weekly_display five_hour_display
+
+  default_profile="$(get_default_profile || true)"
+  live_profile="$(match_live_profile || true)"
+
+  printf '%-16s %-8s %-8s %-24s %s\n' "Profile" "Weekly" "5-hour" "Observed" "Status"
+
+  while IFS= read -r profile; do
+    [[ -n "$profile" ]] || continue
+    found=1
+
+    load_limits_cache_into_memory "$profile"
+    weekly="${PROBE_WEEKLY[$profile]:-}"
+    five_hour="${PROBE_FIVE[$profile]:-}"
+    observed_at="${PROBE_OBSERVED[$profile]:-}"
+    tags=()
+
+    if [[ -n "$weekly" ]]; then
+      weekly_display="${weekly}%"
+    else
+      weekly_display="unknown"
+    fi
+    if [[ -n "$five_hour" ]]; then
+      five_hour_display="${five_hour}%"
+    else
+      five_hour_display="unknown"
+    fi
+    [[ -n "$observed_at" ]] || observed_at="never"
+
+    if [[ "$profile" == "$live_profile" ]]; then
+      tags+=("active")
+    fi
+    if [[ "$profile" == "$default_profile" ]]; then
+      tags+=("default")
+    fi
+
+    if [[ "${#tags[@]}" -gt 0 ]]; then
+      status_text="$(IFS=', '; printf '%s' "${tags[*]}")"
+    else
+      status_text="-"
+    fi
+
+    printf '%-16s %-8s %-8s %-24s %s\n' \
+      "$profile" "$weekly_display" "$five_hour_display" "$observed_at" "$status_text"
+  done < <(saved_profiles)
+
+  if [[ "$found" -eq 0 ]]; then
+    note "No saved Codex auth profiles yet."
+  fi
+}
+
 command_current() {
   local profile
 
@@ -1209,6 +1269,9 @@ main() {
       ;;
     list)
       command_list "$@"
+      ;;
+    limits)
+      command_limits "$@"
       ;;
     current)
       command_current "$@"
