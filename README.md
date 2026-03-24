@@ -32,26 +32,46 @@ This tool therefore uses:
 ## Installation
 
 ```bash
-git clone <private-repo-url>
-cd codex-profile
+sudo apt-get update
+sudo apt-get install -y jq whiptail
+
+mkdir -p ~/.local/bin
+git clone https://github.com/aburgosmelmacia/codex-profile-switcher.git ~/codex-profile-switcher
+cd ~/codex-profile-switcher
 chmod +x bin/codex-profile
-ln -sfn "$(pwd)/bin/codex-profile" ~/.local/bin/codex-profile
+ln -sfn ~/codex-profile-switcher/bin/codex-profile ~/.local/bin/codex-profile
 ```
 
 Make sure `~/.local/bin` is on your `PATH`.
 
+Dependencies:
+
+- `jq` is required for live limit refresh and auto-switch.
+- `whiptail` is required for `codex-profile setup`.
+
 ## Quick start
 
-Login once per account:
+If you already have one account active in `~/.codex`, save it first:
 
 ```bash
 codex-profile save personal
+```
+
+If you are starting from scratch and want to name two accounts directly:
+
+```bash
 codex-profile login personal
 codex-profile login work
 ```
 
-If you are already logged into one account in `~/.codex`, run `save` first so you
-can keep that account as a named profile without logging in again.
+Typical first-time flow when one account is already active:
+
+```bash
+codex-profile save personal
+codex-profile login work
+codex-profile use personal
+codex-profile setup
+```
 
 Under the hood, those commands run:
 
@@ -115,12 +135,13 @@ Show the effective config:
 codex-profile config show
 ```
 
-Or edit it from a small terminal UI:
+Or edit it from the setup TUI:
 
 ```bash
 codex-profile setup
-codex-profile config tui
 ```
+
+`codex-profile config tui` remains available as an alias.
 
 Refresh the known limits for every saved profile:
 
@@ -136,6 +157,11 @@ Behavior:
 - selection prefers higher weekly remaining first, then higher 5-hour remaining
 - after each `codex-profile run`, the selected profile's cache is refreshed from the latest session files
 - if a live probe fails, the tool falls back to the last cached limits for that profile
+
+Trade-offs:
+
+- auto-switch adds a bit of startup latency because it probes limits live
+- those live probes are real Codex runs, so they may consume a small amount of usage
 
 Explicit profile runs such as `codex-profile melmacia2` do not auto-switch away.
 
