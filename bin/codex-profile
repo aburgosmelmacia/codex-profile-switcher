@@ -13,7 +13,7 @@ DEFAULT_FILE="${CODEX_PROFILE_DEFAULT_FILE:-$PROFILE_STORE/.default-profile}"
 CURRENT_FILE="${CODEX_CURRENT_PROFILE_FILE:-$PROFILE_STORE/.current-profile}"
 CONFIG_FILE="${CODEX_PROFILE_CONFIG_FILE:-$PROFILE_STORE/config.toml}"
 LEGACY_PROFILE_ROOT="${CODEX_LEGACY_PROFILE_ROOT:-$HOME/.codex-profiles}"
-PROBE_TIMEOUT_SECONDS="${CODEX_PROFILE_PROBE_TIMEOUT_SECONDS:-6}"
+PROBE_TIMEOUT_SECONDS="${CODEX_PROFILE_PROBE_TIMEOUT_SECONDS:-4}"
 DEBUG_MODE="${CODEX_PROFILE_DEBUG:-0}"
 
 AUTO_SWITCH_ENABLED_DEFAULT="false"
@@ -450,17 +450,18 @@ strip_control_chars() {
   tr -d '\r'
 }
 
-probe_profile_widget_percent() {
+probe_profile_limits() {
   local profile="$1"
-  local widget="$2"
-  local source probe_home capture_file raw capture_cmd percent
+  local source probe_home capture_file raw capture_cmd
+  local -a percents=()
+  local weekly="" five_hour=""
 
   import_legacy_profile_if_needed "$profile"
   source="$(account_path "$profile")"
   [[ -f "$source" ]] || return 1
 
   probe_home="$(mktemp -d "${TMPDIR:-/tmp}/codex-profile-probe-${profile}-XXXXXX")"
-  capture_file="$(mktemp "${TMPDIR:-/tmp}/codex-profile-capture-${profile}-${widget//[^A-Za-z0-9]/_}-XXXXXX")"
+  capture_file="$(mktemp "${TMPDIR:-/tmp}/codex-profile-capture-${profile}-XXXXXX")"
 
   cleanup_probe() {
     rm -rf "$probe_home" "$capture_file"
@@ -470,29 +471,47 @@ probe_profile_widget_percent() {
 
   copy_file_secure "$source" "$probe_home/auth.json"
 
-  capture_cmd="env CODEX_HOME='$probe_home' '$CODEX_BIN' --no-alt-screen -c 'tui.status_line=[\"$widget\"]'"
+  capture_cmd="env CODEX_HOME='$probe_home' '$CODEX_BIN' --no-alt-screen -c 'tui.status_line=[\"weekly-limit\",\"five-hour-limit\"]'"
   timeout "$PROBE_TIMEOUT_SECONDS" script -q -c "$capture_cmd" /dev/null >"$capture_file" 2>&1 || true
 
   raw="$(strip_control_chars <"$capture_file")"
-  debug_note "probe[$profile][$widget] raw=$(printf '%q' "$raw")"
+  debug_note "probe[$profile] raw=$(printf '%q' "$raw")"
 
-  percent="$(printf '%s' "$raw" | grep -Eo '[0-9]{1,3}%' | tail -n 1 | tr -d '%' || true)"
-  if [[ -n "$percent" ]] && [[ "$percent" =~ ^[0-9]+$ ]] && (( percent >= 0 && percent <= 100 )); then
-    printf '%s\n' "$percent"
-    return 0
+  mapfile -t percents < <(printf '%s' "$raw" | grep -Eo '[0-9]{1,3}%' | tr -d '%' || true)
+
+  if (( ${#percents[@]} >= 2 )); then
+    weekly="${percents[${#percents[@]}-2]}"
+    five_hour="${percents[${#percents[@]}-1]}"
+  elif (( ${#percents[@]} == 1 )); then
+    weekly="${percents[0]}"
   fi
 
-  return 1
+  if [[ -n "$weekly" ]] && [[ "$weekly" =~ ^[0-9]+$ ]] && (( weekly >= 0 && weekly <= 100 )); then
+    :
+  else
+    weekly=""
+  fi
+
+  if [[ -n "$five_hour" ]] && [[ "$five_hour" =~ ^[0-9]+$ ]] && (( five_hour >= 0 && five_hour <= 100 )); then
+    :
+  else
+    five_hour=""
+  fi
+
+  printf '%s|%s\n' "$weekly" "$five_hour"
 }
 
 probe_profile_limits_if_needed() {
   local profile="$1"
-  local weekly="" five_hour=""
+  local probe_record="" weekly="" five_hour=""
 
   [[ -n "${PROBE_DONE[$profile]:-}" ]] && return 0
 
-  weekly="$(probe_profile_widget_percent "$profile" "weekly-limit" || true)"
-  five_hour="$(probe_profile_widget_percent "$profile" "five-hour-limit" || true)"
+  stderr_note "Auto-switch: probing '$profile' limits..."
+  probe_record="$(probe_profile_limits "$profile" || true)"
+  weekly="${probe_record%%|*}"
+  five_hour="${probe_record#*|}"
+  [[ "$five_hour" != "$probe_record" ]] || five_hour=""
 
   PROBE_WEEKLY["$profile"]="$weekly"
   PROBE_FIVE["$profile"]="$five_hour"
@@ -635,6 +654,7 @@ effective_run_profile() {
 
   current_profile="$(match_live_profile || true)"
   if [[ -n "$current_profile" ]]; then
+    probe_profile_limits_if_needed "$current_profile"
     trigger_reason="$(auto_switch_trigger_reason "$current_profile" || true)"
     if [[ -z "$trigger_reason" ]]; then
       stderr_note "Auto-switch: keeping '$current_profile'. Current limits are above threshold."
