@@ -97,6 +97,8 @@ Because state is shared, `resume --last` keeps seeing the same session index.
 `codex-profile` can evaluate saved profiles automatically on `run` when no
 explicit profile is provided. This lets you keep using the same command while
 the tool jumps away from the current account if its remaining limits are too low.
+Those limits are tracked from real Codex sessions and cached per profile under
+`~/.codex/.codex-profile/limits`.
 
 Enable it:
 
@@ -120,11 +122,12 @@ codex-profile config tui
 
 Behavior:
 
-- the current profile is probed first
+- the current profile's cached limits are checked first
 - if it is above threshold, it stays active
-- if it falls below threshold, the tool probes the saved profiles
+- if it falls below threshold, the tool compares the saved profiles' cached limits
 - selection prefers higher weekly remaining first, then higher 5-hour remaining
-- if the limits cannot be read, it falls back to the default profile
+- after each `codex-profile run`, the selected profile's cache is refreshed from the latest session files
+- if there is no cached data for the current profile yet, the tool keeps it and learns its limits after that run
 
 Explicit profile runs such as `codex-profile melmacia2` do not auto-switch away.
 
@@ -148,6 +151,7 @@ codex-profile <profile> [-- <codex args...>]
 ## Notes
 
 - Saved auth profiles are stored in `~/.codex/.codex-profile/accounts`.
+- Cached per-profile limits are stored in `~/.codex/.codex-profile/limits`.
 - The live auth file remains `~/.codex/auth.json`.
 - Auto-switch config is stored in `~/.codex/.codex-profile/config.toml`.
 - Profile names accept letters, numbers, dots, dashes, and underscores.
@@ -162,5 +166,5 @@ codex-profile <profile> [-- <codex args...>]
 
 - This approach keeps one shared Codex state directory, but stores one credential snapshot per profile.
 - Credentials still live on disk, so the account snapshot directory should remain private to your user.
-- Limit probing runs in disposable temporary `CODEX_HOME` directories, so shared sessions and history are not polluted.
+- Auto-switch reads limits from local session history instead of probing the TUI live.
 - The tool tries to set restrictive filesystem permissions where possible.

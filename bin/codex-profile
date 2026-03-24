@@ -9,11 +9,11 @@ SHARED_CODEX_HOME="${CODEX_SHARED_HOME:-${CODEX_HOME:-$HOME/.codex}}"
 AUTH_FILE="${AUTH_FILE:-$SHARED_CODEX_HOME/auth.json}"
 PROFILE_STORE="${CODEX_PROFILE_STORE:-$SHARED_CODEX_HOME/.codex-profile}"
 ACCOUNTS_HOME="${CODEX_AUTH_PROFILES_HOME:-$PROFILE_STORE/accounts}"
+LIMITS_HOME="${CODEX_PROFILE_LIMITS_HOME:-$PROFILE_STORE/limits}"
 DEFAULT_FILE="${CODEX_PROFILE_DEFAULT_FILE:-$PROFILE_STORE/.default-profile}"
 CURRENT_FILE="${CODEX_CURRENT_PROFILE_FILE:-$PROFILE_STORE/.current-profile}"
 CONFIG_FILE="${CODEX_PROFILE_CONFIG_FILE:-$PROFILE_STORE/config.toml}"
 LEGACY_PROFILE_ROOT="${CODEX_LEGACY_PROFILE_ROOT:-$HOME/.codex-profiles}"
-PROBE_TIMEOUT_SECONDS="${CODEX_PROFILE_PROBE_TIMEOUT_SECONDS:-4}"
 DEBUG_MODE="${CODEX_PROFILE_DEBUG:-0}"
 
 AUTO_SWITCH_ENABLED_DEFAULT="false"
@@ -25,6 +25,7 @@ AUTO_SWITCH_FALLBACK_DEFAULT="default_profile"
 declare -A PROBE_WEEKLY=()
 declare -A PROBE_FIVE=()
 declare -A PROBE_DONE=()
+declare -A PROBE_OBSERVED=()
 
 die() {
   printf 'Error: %s\n' "$*" >&2
@@ -131,9 +132,10 @@ trim() {
 }
 
 ensure_dirs() {
-  mkdir -p "$SHARED_CODEX_HOME" "$PROFILE_STORE" "$ACCOUNTS_HOME"
+  mkdir -p "$SHARED_CODEX_HOME" "$PROFILE_STORE" "$ACCOUNTS_HOME" "$LIMITS_HOME"
   chmod 700 "$PROFILE_STORE" 2>/dev/null || true
   chmod 700 "$ACCOUNTS_HOME" 2>/dev/null || true
+  chmod 700 "$LIMITS_HOME" 2>/dev/null || true
 }
 
 validate_profile_name() {
@@ -185,6 +187,11 @@ account_path() {
 legacy_auth_path() {
   local profile="$1"
   printf '%s/%s/auth.json\n' "$LEGACY_PROFILE_ROOT" "$profile"
+}
+
+limits_cache_path() {
+  local profile="$1"
+  printf '%s/%s.toml\n' "$LIMITS_HOME" "$profile"
 }
 
 set_default_profile() {
@@ -450,74 +457,140 @@ strip_control_chars() {
   tr -d '\r'
 }
 
-probe_profile_limits() {
+write_limits_cache() {
   local profile="$1"
-  local source probe_home capture_file raw capture_cmd
-  local -a percents=()
-  local weekly="" five_hour=""
+  local weekly="$2"
+  local five_hour="$3"
+  local observed_at="$4"
+  local destination tmp_file
 
-  import_legacy_profile_if_needed "$profile"
-  source="$(account_path "$profile")"
-  [[ -f "$source" ]] || return 1
+  ensure_dirs
+  destination="$(limits_cache_path "$profile")"
+  tmp_file="$(mktemp "${destination}.tmp.XXXXXX")"
 
-  probe_home="$(mktemp -d "${TMPDIR:-/tmp}/codex-profile-probe-${profile}-XXXXXX")"
-  capture_file="$(mktemp "${TMPDIR:-/tmp}/codex-profile-capture-${profile}-XXXXXX")"
+  {
+    printf 'observed_at = "%s"\n' "$observed_at"
+    printf 'weekly_remaining_percent = %s\n' "$weekly"
+    printf 'five_hour_remaining_percent = %s\n' "$five_hour"
+  } >"$tmp_file"
 
-  cleanup_probe() {
-    rm -rf "$probe_home" "$capture_file"
-  }
+  chmod 600 "$tmp_file" 2>/dev/null || true
+  mv "$tmp_file" "$destination"
+}
 
-  trap cleanup_probe RETURN
+load_limits_cache_into_memory() {
+  local profile="$1"
+  local cache_file key value line
+  local weekly="" five_hour="" observed_at=""
 
-  copy_file_secure "$source" "$probe_home/auth.json"
+  [[ -n "${PROBE_DONE[$profile]:-}" ]] && return 0
+  cache_file="$(limits_cache_path "$profile")"
 
-  capture_cmd="env CODEX_HOME='$probe_home' '$CODEX_BIN' --no-alt-screen -c 'tui.status_line=[\"weekly-limit\",\"five-hour-limit\"]'"
-  timeout "$PROBE_TIMEOUT_SECONDS" script -q -c "$capture_cmd" /dev/null >"$capture_file" 2>&1 || true
+  if [[ -f "$cache_file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%%#*}"
+      line="$(trim "$line")"
+      [[ -n "$line" ]] || continue
+      [[ "$line" == *"="* ]] || continue
 
-  raw="$(strip_control_chars <"$capture_file")"
-  debug_note "probe[$profile] raw=$(printf '%q' "$raw")"
+      key="$(trim "${line%%=*}")"
+      value="$(trim "${line#*=}")"
 
-  mapfile -t percents < <(printf '%s' "$raw" | grep -Eo '[0-9]{1,3}%' | tr -d '%' || true)
-
-  if (( ${#percents[@]} >= 2 )); then
-    weekly="${percents[${#percents[@]}-2]}"
-    five_hour="${percents[${#percents[@]}-1]}"
-  elif (( ${#percents[@]} == 1 )); then
-    weekly="${percents[0]}"
+      case "$key" in
+        observed_at)
+          value="${value%\"}"
+          value="${value#\"}"
+          observed_at="$value"
+          ;;
+        weekly_remaining_percent)
+          value="${value//\"/}"
+          weekly="$value"
+          ;;
+        five_hour_remaining_percent)
+          value="${value//\"/}"
+          five_hour="$value"
+          ;;
+      esac
+    done <"$cache_file"
   fi
 
-  if [[ -n "$weekly" ]] && [[ "$weekly" =~ ^[0-9]+$ ]] && (( weekly >= 0 && weekly <= 100 )); then
-    :
-  else
+  if ! [[ "$weekly" =~ ^[0-9]+$ ]]; then
     weekly=""
   fi
-
-  if [[ -n "$five_hour" ]] && [[ "$five_hour" =~ ^[0-9]+$ ]] && (( five_hour >= 0 && five_hour <= 100 )); then
-    :
-  else
+  if ! [[ "$five_hour" =~ ^[0-9]+$ ]]; then
     five_hour=""
   fi
 
-  printf '%s|%s\n' "$weekly" "$five_hour"
-}
-
-probe_profile_limits_if_needed() {
-  local profile="$1"
-  local probe_record="" weekly="" five_hour=""
-
-  [[ -n "${PROBE_DONE[$profile]:-}" ]] && return 0
-
-  stderr_note "Auto-switch: probing '$profile' limits..."
-  probe_record="$(probe_profile_limits "$profile" || true)"
-  weekly="${probe_record%%|*}"
-  five_hour="${probe_record#*|}"
-  [[ "$five_hour" != "$probe_record" ]] || five_hour=""
-
   PROBE_WEEKLY["$profile"]="$weekly"
   PROBE_FIVE["$profile"]="$five_hour"
+  PROBE_OBSERVED["$profile"]="$observed_at"
   PROBE_DONE["$profile"]=1
 
-  debug_note "probe[$profile] weekly=${weekly:-unknown} five_hour=${five_hour:-unknown}"
+  debug_note "limits[$profile] weekly=${weekly:-unknown} five_hour=${five_hour:-unknown} observed_at=${observed_at:-unknown}"
+}
+
+latest_rate_limit_record_from_session_file() {
+  local session_file="$1"
+
+  jq -r '
+    select(.type == "event_msg" and .payload.type == "token_count" and (.payload.rate_limits | type == "object")) |
+    .payload.rate_limits as $rl |
+    def remaining($minutes):
+      if (($rl.primary.window_minutes // -1) == $minutes) then (100 - ($rl.primary.used_percent // 0) | floor | tostring)
+      elif (($rl.secondary.window_minutes // -1) == $minutes) then (100 - ($rl.secondary.used_percent // 0) | floor | tostring)
+      else "" end;
+    [.timestamp, remaining(10080), remaining(300)] | @tsv
+  ' "$session_file" 2>/dev/null | tail -n 1
+}
+
+update_limits_cache_from_recent_sessions() {
+  local profile="$1"
+  local started_epoch="$2"
+  local record="" timestamp="" weekly="" five_hour=""
+  local best_timestamp="" best_weekly="" best_five=""
+  local -a candidate_files=()
+  local candidate file_listing=""
+
+  [[ -d "$SHARED_CODEX_HOME/sessions" ]] || return 0
+
+  file_listing="$(find "$SHARED_CODEX_HOME/sessions" -type f -name '*.jsonl' -newermt "@$((started_epoch - 1))" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 12 || true)"
+  if [[ -z "$file_listing" ]]; then
+    file_listing="$(find "$SHARED_CODEX_HOME/sessions" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 12 || true)"
+  fi
+
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    candidate_files+=("${candidate#* }")
+  done <<<"$file_listing"
+
+  for candidate in "${candidate_files[@]}"; do
+    record="$(latest_rate_limit_record_from_session_file "$candidate" || true)"
+    [[ -n "$record" ]] || continue
+
+    timestamp="${record%%$'\t'*}"
+    record="${record#*$'\t'}"
+    weekly="${record%%$'\t'*}"
+    five_hour="${record#*$'\t'}"
+
+    [[ -n "$weekly" || -n "$five_hour" ]] || continue
+
+    if [[ -z "$best_timestamp" || "$timestamp" > "$best_timestamp" || "$timestamp" == "$best_timestamp" ]]; then
+      best_timestamp="$timestamp"
+      best_weekly="$weekly"
+      best_five="$five_hour"
+    fi
+  done
+
+  if [[ -n "$best_weekly" || -n "$best_five" ]]; then
+    [[ -n "$best_weekly" ]] || best_weekly="0"
+    [[ -n "$best_five" ]] || best_five="0"
+    write_limits_cache "$profile" "$best_weekly" "$best_five" "$best_timestamp"
+    PROBE_WEEKLY["$profile"]="$best_weekly"
+    PROBE_FIVE["$profile"]="$best_five"
+    PROBE_OBSERVED["$profile"]="$best_timestamp"
+    PROBE_DONE["$profile"]=1
+    stderr_note "Auto-switch: updated cached limits for '$profile' (weekly=${best_weekly}%, five-hour=${best_five}%)."
+  fi
 }
 
 metric_score() {
@@ -542,12 +615,12 @@ auto_switch_trigger_reason() {
   local profile="$1"
   local weekly five_hour reasons=()
 
-  probe_profile_limits_if_needed "$profile"
+  load_limits_cache_into_memory "$profile"
   weekly="${PROBE_WEEKLY[$profile]:-}"
   five_hour="${PROBE_FIVE[$profile]:-}"
 
   if [[ -z "$weekly" && -z "$five_hour" ]]; then
-    printf 'limits unreadable\n'
+    printf 'no cached limits\n'
     return 0
   fi
 
@@ -588,7 +661,7 @@ choose_best_profile_record() {
   local profile weekly five_hour weekly_score five_score
 
   for profile in "${profiles[@]}"; do
-    probe_profile_limits_if_needed "$profile"
+    load_limits_cache_into_memory "$profile"
     weekly="${PROBE_WEEKLY[$profile]:-}"
     five_hour="${PROBE_FIVE[$profile]:-}"
     weekly_score="$(metric_score "$weekly")"
@@ -654,16 +727,21 @@ effective_run_profile() {
 
   current_profile="$(match_live_profile || true)"
   if [[ -n "$current_profile" ]]; then
-    probe_profile_limits_if_needed "$current_profile"
+    load_limits_cache_into_memory "$current_profile"
     trigger_reason="$(auto_switch_trigger_reason "$current_profile" || true)"
     if [[ -z "$trigger_reason" ]]; then
       stderr_note "Auto-switch: keeping '$current_profile'. Current limits are above threshold."
       printf '%s\n' "$current_profile"
       return 0
     fi
+    if [[ "$trigger_reason" == "no cached limits" ]]; then
+      stderr_note "Auto-switch: keeping '$current_profile' because there are no cached limits for it yet."
+      printf '%s\n' "$current_profile"
+      return 0
+    fi
     stderr_note "Auto-switch: evaluating alternatives because '$current_profile' hit trigger: $trigger_reason"
   else
-    stderr_note "Auto-switch: no active saved profile detected; selecting the best saved profile."
+    stderr_note "Auto-switch: no active saved profile detected; selecting the best profile from cached limits."
   fi
 
   chosen_record="$(choose_best_profile_record "$default_profile" "${profiles[@]}")"
@@ -1029,6 +1107,8 @@ command_run() {
   local args=()
   local explicit_profile=0
   local selected_profile
+  local started_epoch
+  local exit_status=0
 
   if [[ "${1:-}" == "--" ]]; then
     profile=""
@@ -1055,7 +1135,10 @@ command_run() {
   fi
 
   switch_profile "$selected_profile"
-  exec env CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" "${args[@]}"
+  started_epoch="$(date +%s)"
+  env CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" "${args[@]}" || exit_status=$?
+  update_limits_cache_from_recent_sessions "$selected_profile" "$started_epoch"
+  return "$exit_status"
 }
 
 main() {
