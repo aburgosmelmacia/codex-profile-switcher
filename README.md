@@ -1,28 +1,30 @@
 # codex-profile
 
-Small shell tool to switch between Codex accounts without swapping `auth.json`.
+Small shell tool to switch between Codex accounts while keeping one shared Codex
+workspace.
 
-Instead of copying credentials in and out of `~/.codex/auth.json`, `codex-profile`
-creates one isolated `CODEX_HOME` per profile under `~/.codex-profiles`. That means
-each account keeps its own:
+`codex-profile` keeps:
 
-- login
-- session history
-- cached state
-- config
+- one shared `CODEX_HOME`, usually `~/.codex`
+- one shared set of sessions
+- one shared set of skills
+- one shared config/history/cache
+- one saved `auth.json` snapshot per account
 
-The `login` command in this tool always uses Codex device auth.
+The `login` command in this tool always uses Codex device auth, and the `run`
+command swaps the live `auth.json` before launching Codex.
 
 ## Why this approach
 
-The simplest community tools often swap `auth.json` snapshots. That works, but it
-duplicates tokens and keeps all sessions mixed in a single `~/.codex` directory.
+Using a separate `CODEX_HOME` per account makes authentication easy, but it also
+separates your sessions and local state. If you want to continue old threads no
+matter which account you are currently using, shared state works better.
 
-This tool takes the cleaner route:
+This tool therefore uses:
 
-- `personal` can live in `~/.codex-profiles/personal`
-- `work` can live in `~/.codex-profiles/work`
-- switching accounts is just running Codex with a different `CODEX_HOME`
+- shared state in `~/.codex`
+- saved auth profiles in `~/.codex/.codex-profile/accounts`
+- fast account switching by restoring the chosen auth snapshot
 
 ## Installation
 
@@ -40,14 +42,18 @@ Make sure `~/.local/bin` is on your `PATH`.
 Login once per account:
 
 ```bash
+codex-profile save personal
 codex-profile login personal
 codex-profile login work
 ```
 
+If you are already logged into one account in `~/.codex`, run `save` first so you
+can keep that account as a named profile without logging in again.
+
 Under the hood, those commands run:
 
 ```bash
-CODEX_HOME=~/.codex-profiles/<profile> codex login --device-auth
+CODEX_HOME=~/.codex codex login --device-auth
 ```
 
 Optionally set a default profile:
@@ -81,6 +87,8 @@ codex-profile personal -- resume --last
 codex-profile work -- exec "review this repo"
 ```
 
+Because state is shared, `resume --last` keeps seeing the same session index.
+
 ## Commands
 
 ```text
@@ -88,6 +96,7 @@ codex-profile list
 codex-profile current
 codex-profile use <profile>
 codex-profile path <profile>
+codex-profile save <profile>
 codex-profile login <profile>
 codex-profile status [profile]
 codex-profile run [profile] [-- <codex args...>]
@@ -96,14 +105,16 @@ codex-profile <profile> [-- <codex args...>]
 
 ## Notes
 
-- Profiles are stored in `~/.codex-profiles`.
-- On first use, the tool copies `~/.codex/config.toml` into the new profile if it exists.
+- Saved auth profiles are stored in `~/.codex/.codex-profile/accounts`.
+- The live auth file remains `~/.codex/auth.json`.
 - Profile names accept letters, numbers, dots, dashes, and underscores.
+- `codex-profile save <profile>` snapshots the account already active in `~/.codex/auth.json`.
 - `codex-profile login <profile>` always uses `codex login --device-auth`.
+- This tool imports legacy auth automatically from `~/.codex-profiles/<profile>/auth.json` if present.
 - This tool does not modify a running Codex process. If you already have a Codex session open, start a new one with the desired profile.
 
 ## Security
 
-- This approach avoids rotating one shared `auth.json` in place.
-- Credentials still live on disk, but they stay scoped to each profile directory.
+- This approach keeps one shared Codex state directory, but stores one credential snapshot per profile.
+- Credentials still live on disk, so the account snapshot directory should remain private to your user.
 - The tool tries to set restrictive filesystem permissions where possible.

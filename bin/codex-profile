@@ -5,9 +5,13 @@ shopt -s nullglob
 
 PROGRAM="${0##*/}"
 CODEX_BIN="${CODEX_BIN:-codex}"
-PROFILE_ROOT="${CODEX_PROFILE_ROOT:-$HOME/.codex-profiles}"
-DEFAULT_FILE="${CODEX_PROFILE_DEFAULT_FILE:-$PROFILE_ROOT/.default-profile}"
-BASE_CONFIG_SOURCE="${CODEX_BASE_CONFIG_SOURCE:-$HOME/.codex/config.toml}"
+SHARED_CODEX_HOME="${CODEX_SHARED_HOME:-${CODEX_HOME:-$HOME/.codex}}"
+AUTH_FILE="${AUTH_FILE:-$SHARED_CODEX_HOME/auth.json}"
+PROFILE_STORE="${CODEX_PROFILE_STORE:-$SHARED_CODEX_HOME/.codex-profile}"
+ACCOUNTS_HOME="${CODEX_AUTH_PROFILES_HOME:-$PROFILE_STORE/accounts}"
+DEFAULT_FILE="${CODEX_PROFILE_DEFAULT_FILE:-$PROFILE_STORE/.default-profile}"
+CURRENT_FILE="${CODEX_CURRENT_PROFILE_FILE:-$PROFILE_STORE/.current-profile}"
+LEGACY_PROFILE_ROOT="${CODEX_LEGACY_PROFILE_ROOT:-$HOME/.codex-profiles}"
 
 die() {
   printf 'Error: %s\n' "$*" >&2
@@ -20,7 +24,7 @@ note() {
 
 usage() {
   cat <<EOF
-$PROGRAM - simple profile manager for Codex accounts
+$PROGRAM - shared-session profile manager for Codex accounts
 
 Usage:
   $PROGRAM help
@@ -28,6 +32,7 @@ Usage:
   $PROGRAM current
   $PROGRAM use <profile>
   $PROGRAM path <profile>
+  $PROGRAM save <profile>
   $PROGRAM login <profile>
   $PROGRAM status [profile]
   $PROGRAM run [profile] [-- <codex args...>]
@@ -35,7 +40,7 @@ Usage:
 
 Commands:
   list
-      List saved profiles from $PROFILE_ROOT.
+      List saved auth profiles from $ACCOUNTS_HOME.
 
   current
       Show the default profile.
@@ -44,40 +49,40 @@ Commands:
       Set the default profile.
 
   path <profile>
-      Print the CODEX_HOME directory for a profile.
+      Print the saved auth snapshot path for a profile.
+
+  save <profile>
+      Save the current live auth.json as the named profile without logging in again.
 
   login <profile>
-      Run 'codex login --device-auth' using that profile's CODEX_HOME.
+      Run 'codex login --device-auth' in the shared CODEX_HOME and save the
+      resulting auth.json as the named profile.
 
   status [profile]
-      Show 'codex login status' for a profile.
-      If omitted, uses the default profile.
+      Show live login status. If a profile is provided, also report whether its
+      saved auth snapshot exists and whether it is active.
 
   run [profile] [-- <codex args...>]
-      Run Codex with the selected profile's CODEX_HOME.
-      If profile is omitted, uses the default profile.
+      Restore the selected profile's auth.json into the shared CODEX_HOME and
+      run Codex there. Sessions, skills, history, and config remain shared.
 
   <profile> [-- <codex args...>]
       Shorthand for '$PROGRAM run <profile> [-- <codex args...>]'.
 
-Notes:
-  - Each profile gets its own isolated CODEX_HOME under $PROFILE_ROOT.
-  - This keeps auth, sessions, history, and config separate per account.
-  - On first use, config.toml is copied from $BASE_CONFIG_SOURCE if present.
-
 Examples:
-  $PROGRAM login personal
-  $PROGRAM login work
-  $PROGRAM use work
+  $PROGRAM save melmacia1
+  $PROGRAM login melmacia1
+  $PROGRAM login melmacia2
+  $PROGRAM use melmacia1
   $PROGRAM run
-  $PROGRAM run personal -- resume --last
-  $PROGRAM work
+  $PROGRAM melmacia2 -- resume --last
 EOF
 }
 
-ensure_root() {
-  mkdir -p "$PROFILE_ROOT"
-  chmod 700 "$PROFILE_ROOT" 2>/dev/null || true
+ensure_dirs() {
+  mkdir -p "$SHARED_CODEX_HOME" "$PROFILE_STORE" "$ACCOUNTS_HOME"
+  chmod 700 "$PROFILE_STORE" 2>/dev/null || true
+  chmod 700 "$ACCOUNTS_HOME" 2>/dev/null || true
 }
 
 validate_profile_name() {
@@ -90,14 +95,14 @@ validate_profile_name() {
   fi
 }
 
-profile_dir() {
+account_path() {
   local profile="$1"
-  printf '%s/%s\n' "$PROFILE_ROOT" "$profile"
+  printf '%s/%s.auth.json\n' "$ACCOUNTS_HOME" "$profile"
 }
 
-profile_config() {
+legacy_auth_path() {
   local profile="$1"
-  printf '%s/config.toml\n' "$(profile_dir "$profile")"
+  printf '%s/%s/auth.json\n' "$LEGACY_PROFILE_ROOT" "$profile"
 }
 
 set_default_profile() {
@@ -117,27 +122,84 @@ get_default_profile() {
   printf '%s\n' "$profile"
 }
 
-ensure_profile_dir() {
+set_current_profile() {
   local profile="$1"
-  local dir
 
-  dir="$(profile_dir "$profile")"
-  mkdir -p "$dir"
-  chmod 700 "$dir" 2>/dev/null || true
+  printf '%s\n' "$profile" >"$CURRENT_FILE"
+  chmod 600 "$CURRENT_FILE" 2>/dev/null || true
 }
 
-bootstrap_config() {
-  local profile="$1"
-  local target tmp_file
+get_recorded_current_profile() {
+  [[ -f "$CURRENT_FILE" ]] || return 1
 
-  target="$(profile_config "$profile")"
-  [[ -f "$target" ]] && return 0
-  [[ -f "$BASE_CONFIG_SOURCE" ]] || return 0
+  local profile=""
+  IFS= read -r profile <"$CURRENT_FILE" || true
+  [[ -n "$profile" ]] || return 1
+  validate_profile_name "$profile"
+  printf '%s\n' "$profile"
+}
 
-  tmp_file="$(mktemp "${target}.tmp.XXXXXX")"
-  cp "$BASE_CONFIG_SOURCE" "$tmp_file"
+copy_file_secure() {
+  local source="$1"
+  local destination="$2"
+  local tmp_file
+
+  tmp_file="$(mktemp "${destination}.tmp.XXXXXX")"
+  cp "$source" "$tmp_file"
   chmod 600 "$tmp_file" 2>/dev/null || true
-  mv "$tmp_file" "$target"
+  mv "$tmp_file" "$destination"
+}
+
+import_legacy_profile_if_needed() {
+  local profile="$1"
+  local target legacy
+
+  target="$(account_path "$profile")"
+  [[ -f "$target" ]] && return 0
+
+  legacy="$(legacy_auth_path "$profile")"
+  [[ -f "$legacy" ]] || return 0
+
+  copy_file_secure "$legacy" "$target"
+  note "Imported legacy auth for '$profile' from $legacy."
+}
+
+require_live_auth() {
+  [[ -f "$AUTH_FILE" ]] || die "No live auth file found at $AUTH_FILE. Run '$PROGRAM login <profile>' first."
+}
+
+save_live_auth_as_profile() {
+  local profile="$1"
+
+  require_live_auth
+  copy_file_secure "$AUTH_FILE" "$(account_path "$profile")"
+}
+
+restore_profile_auth() {
+  local profile="$1"
+  local source
+
+  import_legacy_profile_if_needed "$profile"
+  source="$(account_path "$profile")"
+  [[ -f "$source" ]] || die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
+  copy_file_secure "$source" "$AUTH_FILE"
+}
+
+match_live_profile() {
+  [[ -f "$AUTH_FILE" ]] || return 1
+
+  local file profile
+  for file in "$ACCOUNTS_HOME"/*.auth.json; do
+    [[ -f "$file" ]] || continue
+    if cmp -s "$AUTH_FILE" "$file"; then
+      profile="${file##*/}"
+      profile="${profile%.auth.json}"
+      printf '%s\n' "$profile"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 resolve_profile() {
@@ -152,37 +214,77 @@ resolve_profile() {
   get_default_profile || die "No default profile set. Run '$PROGRAM use <profile>' or pass a profile explicitly."
 }
 
-list_profiles() {
-  ensure_root
+refresh_recorded_profile_snapshot() {
+  local live_profile="${1:-}"
 
-  local default_profile profile_path profile_name found=0 marker=" "
-  default_profile="$(get_default_profile || true)"
+  [[ -n "$live_profile" ]] || return 0
+  [[ -f "$AUTH_FILE" ]] || return 0
+  save_live_auth_as_profile "$live_profile"
+}
 
-  for profile_path in "$PROFILE_ROOT"/*; do
-    [[ -d "$profile_path" ]] || continue
-    profile_name="${profile_path##*/}"
-    validate_profile_name "$profile_name"
-    found=1
-    marker=" "
-    [[ "$profile_name" == "$default_profile" ]] && marker="*"
-    printf '%s %s\n' "$marker" "$profile_name"
-  done
+switch_profile() {
+  local target="$1"
+  local live_profile=""
+  local recorded_profile=""
 
-  if [[ "$found" -eq 0 ]]; then
-    note "No Codex profiles saved yet."
+  import_legacy_profile_if_needed "$target"
+
+  live_profile="$(match_live_profile || true)"
+  recorded_profile="$(get_recorded_current_profile || true)"
+
+  if [[ "$live_profile" == "$target" ]]; then
+    set_current_profile "$target"
     return 0
   fi
 
-  if [[ -n "$default_profile" ]]; then
-    note ""
-    note "* default profile"
+  if [[ -n "$live_profile" ]]; then
+    refresh_recorded_profile_snapshot "$live_profile"
+  elif [[ -n "$recorded_profile" ]]; then
+    refresh_recorded_profile_snapshot "$recorded_profile"
+  fi
+
+  restore_profile_auth "$target"
+  set_current_profile "$target"
+}
+
+command_list() {
+  ensure_dirs
+
+  local default_profile live_profile profile_path profile_name found=0 tags
+  default_profile="$(get_default_profile || true)"
+  live_profile="$(match_live_profile || true)"
+
+  for profile_path in "$ACCOUNTS_HOME"/*.auth.json; do
+    [[ -f "$profile_path" ]] || continue
+    found=1
+    profile_name="${profile_path##*/}"
+    profile_name="${profile_name%.auth.json}"
+    tags=()
+
+    if [[ "$profile_name" == "$live_profile" ]]; then
+      tags+=("active")
+    fi
+
+    if [[ "$profile_name" == "$default_profile" ]]; then
+      tags+=("default")
+    fi
+
+    if [[ "${#tags[@]}" -gt 0 ]]; then
+      printf '%s (%s)\n' "$profile_name" "$(IFS=', '; printf '%s' "${tags[*]}")"
+    else
+      printf '%s\n' "$profile_name"
+    fi
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    note "No saved Codex auth profiles yet."
   fi
 }
 
 command_current() {
   local profile
-  profile="$(get_default_profile || true)"
 
+  profile="$(get_default_profile || true)"
   if [[ -n "$profile" ]]; then
     note "$profile"
   else
@@ -192,49 +294,75 @@ command_current() {
 
 command_use() {
   local profile="${1:-}"
+
   validate_profile_name "$profile"
-  ensure_root
-  ensure_profile_dir "$profile"
-  bootstrap_config "$profile"
+  ensure_dirs
+  import_legacy_profile_if_needed "$profile"
   set_default_profile "$profile"
   note "Default profile set to '$profile'."
 }
 
 command_path() {
   local profile="${1:-}"
+
   validate_profile_name "$profile"
-  ensure_root
-  note "$(profile_dir "$profile")"
+  ensure_dirs
+  note "$(account_path "$profile")"
+}
+
+command_save() {
+  local profile="${1:-}"
+
+  validate_profile_name "$profile"
+  ensure_dirs
+  save_live_auth_as_profile "$profile"
+  set_current_profile "$profile"
+  note "Saved live auth as '$profile'."
 }
 
 command_login() {
   local profile="${1:-}"
-  local dir
 
   validate_profile_name "$profile"
-  ensure_root
-  ensure_profile_dir "$profile"
-  bootstrap_config "$profile"
-  dir="$(profile_dir "$profile")"
+  ensure_dirs
 
-  note "Using CODEX_HOME=$dir"
-  CODEX_HOME="$dir" "$CODEX_BIN" login --device-auth
+  note "Using shared CODEX_HOME=$SHARED_CODEX_HOME"
+  CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" login --device-auth
+  save_live_auth_as_profile "$profile"
+  set_current_profile "$profile"
+  note "Saved live auth as '$profile'."
 }
 
 command_status() {
-  local profile dir
+  local profile="${1:-}"
+  local live_profile="" saved_state="missing"
 
-  profile="$(resolve_profile "${1:-}")"
-  ensure_root
-  ensure_profile_dir "$profile"
-  bootstrap_config "$profile"
-  dir="$(profile_dir "$profile")"
+  ensure_dirs
 
-  CODEX_HOME="$dir" "$CODEX_BIN" login status
+  if [[ -n "$profile" ]]; then
+    validate_profile_name "$profile"
+    import_legacy_profile_if_needed "$profile"
+    [[ -f "$(account_path "$profile")" ]] && saved_state="saved"
+  fi
+
+  CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" login status
+  live_profile="$(match_live_profile || true)"
+
+  if [[ -n "$profile" ]]; then
+    if [[ "$saved_state" == "missing" ]]; then
+      note "Profile '$profile': no saved auth snapshot."
+    elif [[ "$live_profile" == "$profile" ]]; then
+      note "Profile '$profile': saved and active."
+    else
+      note "Profile '$profile': saved but not active."
+    fi
+  elif [[ -n "$live_profile" ]]; then
+    note "Active saved profile: $live_profile"
+  fi
 }
 
 command_run() {
-  local profile dir
+  local profile args=()
 
   if [[ "${1:-}" == "--" ]]; then
     profile="$(resolve_profile "")"
@@ -249,12 +377,11 @@ command_run() {
     shift
   fi
 
-  ensure_root
-  ensure_profile_dir "$profile"
-  bootstrap_config "$profile"
-  dir="$(profile_dir "$profile")"
+  args=("$@")
 
-  exec env CODEX_HOME="$dir" "$CODEX_BIN" "$@"
+  ensure_dirs
+  switch_profile "$profile"
+  exec env CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" "${args[@]}"
 }
 
 main() {
@@ -266,16 +393,19 @@ main() {
       usage
       ;;
     list)
-      list_profiles
+      command_list "$@"
       ;;
     current)
-      command_current
+      command_current "$@"
       ;;
     use)
       command_use "$@"
       ;;
     path)
       command_path "$@"
+      ;;
+    save)
+      command_save "$@"
       ;;
     login)
       command_login "$@"
