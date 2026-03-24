@@ -14,6 +14,9 @@ workspace.
 The `login` command in this tool always uses Codex device auth, and the `run`
 command swaps the live `auth.json` before launching Codex.
 
+It can also auto-switch between saved profiles when the active one falls below
+configured weekly or 5-hour thresholds.
+
 ## Why this approach
 
 Using a separate `CODEX_HOME` per account makes authentication easy, but it also
@@ -89,6 +92,36 @@ codex-profile work -- exec "review this repo"
 
 Because state is shared, `resume --last` keeps seeing the same session index.
 
+## Auto-switch
+
+`codex-profile` can evaluate saved profiles automatically on `run` when no
+explicit profile is provided. This lets you keep using the same command while
+the tool jumps away from the current account if its remaining limits are too low.
+
+Enable it:
+
+```bash
+codex-profile config set auto_switch.enabled true
+codex-profile config set auto_switch.weekly_threshold_percent 20
+codex-profile config set auto_switch.five_hour_threshold_percent 20
+```
+
+Show the effective config:
+
+```bash
+codex-profile config show
+```
+
+Behavior:
+
+- the current profile is probed first
+- if it is above threshold, it stays active
+- if it falls below threshold, the tool probes the saved profiles
+- selection prefers higher weekly remaining first, then higher 5-hour remaining
+- if the limits cannot be read, it falls back to the default profile
+
+Explicit profile runs such as `codex-profile melmacia2` do not auto-switch away.
+
 ## Commands
 
 ```text
@@ -99,6 +132,8 @@ codex-profile path <profile>
 codex-profile save <profile>
 codex-profile login <profile>
 codex-profile status [profile]
+codex-profile config show
+codex-profile config set <key> <value>
 codex-profile run [profile] [-- <codex args...>]
 codex-profile <profile> [-- <codex args...>]
 ```
@@ -107,9 +142,11 @@ codex-profile <profile> [-- <codex args...>]
 
 - Saved auth profiles are stored in `~/.codex/.codex-profile/accounts`.
 - The live auth file remains `~/.codex/auth.json`.
+- Auto-switch config is stored in `~/.codex/.codex-profile/config.toml`.
 - Profile names accept letters, numbers, dots, dashes, and underscores.
 - `codex-profile save <profile>` snapshots the account already active in `~/.codex/auth.json`.
 - `codex-profile login <profile>` always uses `codex login --device-auth`.
+- Auto-switch applies only to `codex-profile run` without an explicit profile.
 - This tool imports legacy auth automatically from `~/.codex-profiles/<profile>/auth.json` if present.
 - This tool does not modify a running Codex process. If you already have a Codex session open, start a new one with the desired profile.
 
@@ -117,4 +154,5 @@ codex-profile <profile> [-- <codex args...>]
 
 - This approach keeps one shared Codex state directory, but stores one credential snapshot per profile.
 - Credentials still live on disk, so the account snapshot directory should remain private to your user.
+- Limit probing runs in disposable temporary `CODEX_HOME` directories, so shared sessions and history are not polluted.
 - The tool tries to set restrictive filesystem permissions where possible.
