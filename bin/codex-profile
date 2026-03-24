@@ -55,6 +55,7 @@ Usage:
   $PROGRAM help
   $PROGRAM list
   $PROGRAM limits
+  $PROGRAM limits refresh [profile]
   $PROGRAM current
   $PROGRAM use <profile>
   $PROGRAM path <profile>
@@ -73,6 +74,7 @@ Commands:
 
   limits
       Show the last known weekly and 5-hour limits cached for each saved profile.
+      Use 'limits refresh [profile]' to force a live refresh first.
 
   current
       Show the default profile.
@@ -123,6 +125,8 @@ Examples:
   $PROGRAM save melmacia1
   $PROGRAM login melmacia2
   $PROGRAM limits
+  $PROGRAM limits refresh
+  $PROGRAM limits refresh melmacia2
   $PROGRAM config tui
   $PROGRAM config set auto_switch.enabled true
   $PROGRAM config set auto_switch.weekly_threshold_percent 20
@@ -858,7 +862,16 @@ command_list() {
   fi
 }
 
-command_limits() {
+reset_probe_memory_for_profile() {
+  local profile="$1"
+
+  unset 'PROBE_WEEKLY[$profile]'
+  unset 'PROBE_FIVE[$profile]'
+  unset 'PROBE_DONE[$profile]'
+  unset 'PROBE_OBSERVED[$profile]'
+}
+
+print_limits_table() {
   ensure_dirs
 
   local default_profile live_profile found=0
@@ -911,6 +924,64 @@ command_limits() {
   if [[ "$found" -eq 0 ]]; then
     note "No saved Codex auth profiles yet."
   fi
+}
+
+command_limits_refresh() {
+  ensure_dirs
+
+  local requested_profile="${1:-}"
+  local profiles=()
+  local profile refreshed=0
+
+  if [[ -n "$requested_profile" ]]; then
+    validate_profile_name "$requested_profile"
+    profiles=("$requested_profile")
+  else
+    while IFS= read -r profile; do
+      [[ -n "$profile" ]] || continue
+      profiles+=("$profile")
+    done < <(saved_profiles)
+  fi
+
+  if [[ "${#profiles[@]}" -eq 0 ]]; then
+    note "No saved Codex auth profiles yet."
+    return 0
+  fi
+
+  for profile in "${profiles[@]}"; do
+    import_legacy_profile_if_needed "$profile"
+    if [[ ! -f "$(account_path "$profile")" ]]; then
+      die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
+    fi
+
+    reset_probe_memory_for_profile "$profile"
+    if probe_profile_limits_if_needed "$profile"; then
+      refreshed=1
+    fi
+  done
+
+  if [[ "$refreshed" -eq 0 ]]; then
+    stderr_note "No live limits could be refreshed. Showing last known values."
+  fi
+
+  print_limits_table
+}
+
+command_limits() {
+  local subcommand="${1:-show}"
+  shift || true
+
+  case "$subcommand" in
+    show)
+      print_limits_table
+      ;;
+    refresh)
+      command_limits_refresh "$@"
+      ;;
+    *)
+      die "Unknown limits command '$subcommand'. Use: limits, limits refresh [profile]."
+      ;;
+  esac
 }
 
 command_current() {
