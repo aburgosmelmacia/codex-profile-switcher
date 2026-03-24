@@ -13,7 +13,9 @@ LIMITS_HOME="${CODEX_PROFILE_LIMITS_HOME:-$PROFILE_STORE/limits}"
 DEFAULT_FILE="${CODEX_PROFILE_DEFAULT_FILE:-$PROFILE_STORE/.default-profile}"
 CURRENT_FILE="${CODEX_CURRENT_PROFILE_FILE:-$PROFILE_STORE/.current-profile}"
 CONFIG_FILE="${CODEX_PROFILE_CONFIG_FILE:-$PROFILE_STORE/config.toml}"
+PROBE_ROOT="${CODEX_PROFILE_PROBE_ROOT:-$PROFILE_STORE/probes}"
 LEGACY_PROFILE_ROOT="${CODEX_LEGACY_PROFILE_ROOT:-$HOME/.codex-profiles}"
+LIVE_PROBE_TIMEOUT_SECONDS="${CODEX_PROFILE_LIVE_PROBE_TIMEOUT_SECONDS:-25}"
 DEBUG_MODE="${CODEX_PROFILE_DEBUG:-0}"
 
 AUTO_SWITCH_ENABLED_DEFAULT="false"
@@ -132,10 +134,11 @@ trim() {
 }
 
 ensure_dirs() {
-  mkdir -p "$SHARED_CODEX_HOME" "$PROFILE_STORE" "$ACCOUNTS_HOME" "$LIMITS_HOME"
+  mkdir -p "$SHARED_CODEX_HOME" "$PROFILE_STORE" "$ACCOUNTS_HOME" "$LIMITS_HOME" "$PROBE_ROOT"
   chmod 700 "$PROFILE_STORE" 2>/dev/null || true
   chmod 700 "$ACCOUNTS_HOME" 2>/dev/null || true
   chmod 700 "$LIMITS_HOME" 2>/dev/null || true
+  chmod 700 "$PROBE_ROOT" 2>/dev/null || true
 }
 
 validate_profile_name() {
@@ -546,16 +549,17 @@ latest_rate_limit_record_from_session_file() {
 update_limits_cache_from_recent_sessions() {
   local profile="$1"
   local started_epoch="$2"
+  local shared_home="${3:-$SHARED_CODEX_HOME}"
   local record="" timestamp="" weekly="" five_hour=""
   local best_timestamp="" best_weekly="" best_five=""
   local -a candidate_files=()
   local candidate file_listing=""
 
-  [[ -d "$SHARED_CODEX_HOME/sessions" ]] || return 0
+  [[ -d "$shared_home/sessions" ]] || return 0
 
-  file_listing="$(find "$SHARED_CODEX_HOME/sessions" -type f -name '*.jsonl' -newermt "@$((started_epoch - 1))" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 12 || true)"
+  file_listing="$(find "$shared_home/sessions" -type f -name '*.jsonl' -newermt "@$((started_epoch - 1))" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 12 || true)"
   if [[ -z "$file_listing" ]]; then
-    file_listing="$(find "$SHARED_CODEX_HOME/sessions" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 12 || true)"
+    file_listing="$(find "$shared_home/sessions" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 12 || true)"
   fi
 
   while IFS= read -r candidate; do
@@ -593,6 +597,65 @@ update_limits_cache_from_recent_sessions() {
   fi
 }
 
+live_probe_profile_limits() {
+  local profile="$1"
+  local source probe_home probe_workspace stdout_file stderr_file started_epoch
+  local timestamp="" weekly="" five_hour=""
+
+  import_legacy_profile_if_needed "$profile"
+  source="$(account_path "$profile")"
+  [[ -f "$source" ]] || return 1
+  ensure_dirs
+
+  probe_home="$(mktemp -d "$PROBE_ROOT/${profile}.home.XXXXXX")"
+  probe_workspace="$(mktemp -d "$PROBE_ROOT/${profile}.work.XXXXXX")"
+  stdout_file="$(mktemp "$PROBE_ROOT/${profile}.stdout.XXXXXX")"
+  stderr_file="$(mktemp "$PROBE_ROOT/${profile}.stderr.XXXXXX")"
+
+  copy_file_secure "$source" "$probe_home/auth.json"
+  if [[ -f "$SHARED_CODEX_HOME/config.toml" ]]; then
+    copy_file_secure "$SHARED_CODEX_HOME/config.toml" "$probe_home/config.toml"
+  fi
+
+  started_epoch="$(date +%s)"
+  timeout "$LIVE_PROBE_TIMEOUT_SECONDS" env CODEX_HOME="$probe_home" "$CODEX_BIN" exec --json \
+    --skip-git-repo-check -C "$probe_workspace" "Respond with exactly OK." >"$stdout_file" 2>"$stderr_file" || true
+
+  debug_note "live-probe[$profile] stdout=$(printf '%q' "$(cat "$stdout_file" 2>/dev/null || true)")"
+  debug_note "live-probe[$profile] stderr=$(printf '%q' "$(cat "$stderr_file" 2>/dev/null || true)")"
+
+  update_limits_cache_from_recent_sessions "$profile" "$started_epoch" "$probe_home" || true
+  timestamp="${PROBE_OBSERVED[$profile]:-}"
+  weekly="${PROBE_WEEKLY[$profile]:-}"
+  five_hour="${PROBE_FIVE[$profile]:-}"
+
+  if [[ -n "$weekly" || -n "$five_hour" ]]; then
+    PROBE_OBSERVED["$profile"]="$timestamp"
+    PROBE_WEEKLY["$profile"]="$weekly"
+    PROBE_FIVE["$profile"]="$five_hour"
+    PROBE_DONE["$profile"]=1
+    rm -rf "$probe_home" "$probe_workspace" "$stdout_file" "$stderr_file"
+    return 0
+  fi
+
+  rm -rf "$probe_home" "$probe_workspace" "$stdout_file" "$stderr_file"
+  return 1
+}
+
+probe_profile_limits_if_needed() {
+  local profile="$1"
+
+  [[ -n "${PROBE_DONE[$profile]:-}" ]] && return 0
+
+  stderr_note "Auto-switch: probing live limits for '$profile'..."
+  if live_probe_profile_limits "$profile"; then
+    return 0
+  fi
+
+  stderr_note "Auto-switch: live probe failed for '$profile'; falling back to cached limits."
+  load_limits_cache_into_memory "$profile"
+}
+
 metric_score() {
   local metric="${1:-}"
 
@@ -615,12 +678,12 @@ auto_switch_trigger_reason() {
   local profile="$1"
   local weekly five_hour reasons=()
 
-  load_limits_cache_into_memory "$profile"
+  probe_profile_limits_if_needed "$profile"
   weekly="${PROBE_WEEKLY[$profile]:-}"
   five_hour="${PROBE_FIVE[$profile]:-}"
 
   if [[ -z "$weekly" && -z "$five_hour" ]]; then
-    printf 'no cached limits\n'
+    printf 'limits unavailable\n'
     return 0
   fi
 
@@ -661,7 +724,7 @@ choose_best_profile_record() {
   local profile weekly five_hour weekly_score five_score
 
   for profile in "${profiles[@]}"; do
-    load_limits_cache_into_memory "$profile"
+    probe_profile_limits_if_needed "$profile"
     weekly="${PROBE_WEEKLY[$profile]:-}"
     five_hour="${PROBE_FIVE[$profile]:-}"
     weekly_score="$(metric_score "$weekly")"
@@ -727,21 +790,16 @@ effective_run_profile() {
 
   current_profile="$(match_live_profile || true)"
   if [[ -n "$current_profile" ]]; then
-    load_limits_cache_into_memory "$current_profile"
+    probe_profile_limits_if_needed "$current_profile"
     trigger_reason="$(auto_switch_trigger_reason "$current_profile" || true)"
     if [[ -z "$trigger_reason" ]]; then
       stderr_note "Auto-switch: keeping '$current_profile'. Current limits are above threshold."
       printf '%s\n' "$current_profile"
       return 0
     fi
-    if [[ "$trigger_reason" == "no cached limits" ]]; then
-      stderr_note "Auto-switch: keeping '$current_profile' because there are no cached limits for it yet."
-      printf '%s\n' "$current_profile"
-      return 0
-    fi
     stderr_note "Auto-switch: evaluating alternatives because '$current_profile' hit trigger: $trigger_reason"
   else
-    stderr_note "Auto-switch: no active saved profile detected; selecting the best profile from cached limits."
+    stderr_note "Auto-switch: no active saved profile detected; selecting the best profile from live limits."
   fi
 
   chosen_record="$(choose_best_profile_record "$default_profile" "${profiles[@]}")"

@@ -97,8 +97,9 @@ Because state is shared, `resume --last` keeps seeing the same session index.
 `codex-profile` can evaluate saved profiles automatically on `run` when no
 explicit profile is provided. This lets you keep using the same command while
 the tool jumps away from the current account if its remaining limits are too low.
-Those limits are tracked from real Codex sessions and cached per profile under
-`~/.codex/.codex-profile/limits`.
+On each auto-switch run, it performs a short non-interactive Codex refresh for
+the relevant profiles, reads the resulting `rate_limits`, and keeps a local
+cache under `~/.codex/.codex-profile/limits` as a fallback.
 
 Enable it:
 
@@ -122,12 +123,12 @@ codex-profile config tui
 
 Behavior:
 
-- the current profile's cached limits are checked first
+- the current profile is refreshed first with a short non-interactive probe
 - if it is above threshold, it stays active
-- if it falls below threshold, the tool compares the saved profiles' cached limits
+- if it falls below threshold, the tool refreshes the other saved profiles and compares them
 - selection prefers higher weekly remaining first, then higher 5-hour remaining
 - after each `codex-profile run`, the selected profile's cache is refreshed from the latest session files
-- if there is no cached data for the current profile yet, the tool keeps it and learns its limits after that run
+- if a live probe fails, the tool falls back to the last cached limits for that profile
 
 Explicit profile runs such as `codex-profile melmacia2` do not auto-switch away.
 
@@ -166,5 +167,5 @@ codex-profile <profile> [-- <codex args...>]
 
 - This approach keeps one shared Codex state directory, but stores one credential snapshot per profile.
 - Credentials still live on disk, so the account snapshot directory should remain private to your user.
-- Auto-switch reads limits from local session history instead of probing the TUI live.
+- Auto-switch refreshes limits with short isolated Codex runs and falls back to cached local session data if needed.
 - The tool tries to set restrictive filesystem permissions where possible.
