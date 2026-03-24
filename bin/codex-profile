@@ -59,6 +59,7 @@ Usage:
   $PROGRAM status [profile]
   $PROGRAM config show
   $PROGRAM config set <key> <value>
+  $PROGRAM config tui
   $PROGRAM run [profile] [-- <codex args...>]
   $PROGRAM <profile> [-- <codex args...>]
 
@@ -98,6 +99,10 @@ Commands:
         auto_switch.policy
         auto_switch.fallback
 
+  config tui
+      Open a small whiptail-based TUI to edit auto-switch config and the default
+      profile.
+
   run [profile] [-- <codex args...>]
       Restore the selected profile's auth.json into the shared CODEX_HOME and
       run Codex there. Sessions, skills, history, and config remain shared.
@@ -110,6 +115,7 @@ Commands:
 Examples:
   $PROGRAM save melmacia1
   $PROGRAM login melmacia2
+  $PROGRAM config tui
   $PROGRAM config set auto_switch.enabled true
   $PROGRAM config set auto_switch.weekly_threshold_percent 20
   $PROGRAM run
@@ -828,6 +834,156 @@ command_config_set() {
   note "Updated $key."
 }
 
+require_whiptail() {
+  command -v whiptail >/dev/null 2>&1 || die "whiptail is required for 'config tui'."
+}
+
+whiptail_capture() {
+  whiptail "$@" 3>&1 1>&2 2>&3
+}
+
+config_summary_text() {
+  local default_profile=""
+
+  default_profile="$(get_default_profile || true)"
+  [[ -n "$default_profile" ]] || default_profile="unset"
+
+  printf 'Config file: %s\n' "$CONFIG_FILE"
+  printf 'Auto-switch enabled: %s\n' "$AUTO_SWITCH_ENABLED"
+  printf 'Weekly threshold: %s%%\n' "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT"
+  printf '5-hour threshold: %s%%\n' "$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT"
+  printf 'Policy: %s\n' "$AUTO_SWITCH_POLICY"
+  printf 'Fallback: %s\n' "$AUTO_SWITCH_FALLBACK"
+  printf 'Default profile: %s\n' "$default_profile"
+  printf '\n'
+  printf 'Auto-switch only affects: codex-profile run\n'
+  printf 'Explicit profile runs stay fixed on the chosen profile.\n'
+}
+
+config_tui_toggle_enabled() {
+  local prompt="Auto-switch is currently '$AUTO_SWITCH_ENABLED'. Toggle it?"
+
+  if whiptail --title "codex-profile" --yesno "$prompt" 10 70; then
+    if [[ "$AUTO_SWITCH_ENABLED" == "true" ]]; then
+      AUTO_SWITCH_ENABLED="false"
+    else
+      AUTO_SWITCH_ENABLED="true"
+    fi
+    write_config
+  fi
+}
+
+config_tui_edit_threshold() {
+  local key="$1"
+  local label="$2"
+  local current_value="$3"
+  local input=""
+
+  while true; do
+    input="$(whiptail_capture --title "codex-profile" --inputbox "Set $label (0-100)." 10 70 "$current_value")" || return 0
+    input="$(trim "$input")"
+
+    if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 0 && input <= 100 )); then
+      break
+    fi
+
+    whiptail --title "codex-profile" --msgbox "Enter a whole number between 0 and 100." 8 60
+    current_value="$input"
+  done
+
+  case "$key" in
+    weekly)
+      AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT="$input"
+      ;;
+    five_hour)
+      AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT="$input"
+      ;;
+  esac
+
+  write_config
+}
+
+config_tui_edit_policy() {
+  local choice=""
+
+  choice="$(whiptail_capture --title "codex-profile" --menu "Select auto-switch policy." 14 72 4 \
+    "or" "Switch when weekly OR 5-hour falls below threshold." \
+    "and" "Switch only when both weekly AND 5-hour fall below threshold." \
+    "weekly_only" "Switch based only on the weekly threshold." \
+    "cancel" "Return without changing anything.")" || return 0
+
+  [[ "$choice" == "cancel" ]] && return 0
+  validate_policy "$choice"
+  AUTO_SWITCH_POLICY="$choice"
+  write_config
+}
+
+config_tui_select_default_profile() {
+  local profiles=()
+  local profile choice=""
+
+  while IFS= read -r profile; do
+    [[ -n "$profile" ]] || continue
+    profiles+=("$profile" "$profile")
+  done < <(saved_profiles)
+
+  if [[ "${#profiles[@]}" -eq 0 ]]; then
+    whiptail --title "codex-profile" --msgbox "No saved profiles are available yet." 8 60
+    return 0
+  fi
+
+  choice="$(whiptail_capture --title "codex-profile" --menu "Select the default profile." 16 72 8 "${profiles[@]}")" || return 0
+  validate_profile_name "$choice"
+  set_default_profile "$choice"
+}
+
+command_config_tui() {
+  local selection=""
+  local default_profile=""
+
+  require_whiptail
+  ensure_dirs
+
+  while true; do
+    load_config
+    default_profile="$(get_default_profile || true)"
+    [[ -n "$default_profile" ]] || default_profile="unset"
+
+    selection="$(whiptail_capture --title "codex-profile" --menu "Configure codex-profile." 20 78 10 \
+      "toggle_auto_switch" "Enabled: $AUTO_SWITCH_ENABLED" \
+      "weekly_threshold" "Weekly threshold: ${AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT}%" \
+      "five_hour_threshold" "5-hour threshold: ${AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT}%" \
+      "policy" "Policy: $AUTO_SWITCH_POLICY" \
+      "default_profile" "Default profile: $default_profile" \
+      "show_config" "Show effective config" \
+      "exit" "Exit the TUI")" || break
+
+    case "$selection" in
+      toggle_auto_switch)
+        config_tui_toggle_enabled
+        ;;
+      weekly_threshold)
+        config_tui_edit_threshold "weekly" "weekly threshold percent" "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT"
+        ;;
+      five_hour_threshold)
+        config_tui_edit_threshold "five_hour" "5-hour threshold percent" "$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT"
+        ;;
+      policy)
+        config_tui_edit_policy
+        ;;
+      default_profile)
+        config_tui_select_default_profile
+        ;;
+      show_config)
+        whiptail --title "codex-profile" --msgbox "$(config_summary_text)" 16 78
+        ;;
+      exit)
+        break
+        ;;
+    esac
+  done
+}
+
 command_config() {
   local subcommand="${1:-show}"
   shift || true
@@ -839,8 +995,11 @@ command_config() {
     set)
       command_config_set "$@"
       ;;
+    tui)
+      command_config_tui "$@"
+      ;;
     *)
-      die "Unknown config command '$subcommand'. Use: show, set."
+      die "Unknown config command '$subcommand'. Use: show, set, tui."
       ;;
   esac
 }

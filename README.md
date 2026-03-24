@@ -112,6 +112,12 @@ Show the effective config:
 codex-profile config show
 ```
 
+Or edit it from a small terminal UI:
+
+```bash
+codex-profile config tui
+```
+
 Behavior:
 
 - the current profile is probed first
@@ -134,6 +140,7 @@ codex-profile login <profile>
 codex-profile status [profile]
 codex-profile config show
 codex-profile config set <key> <value>
+codex-profile config tui
 codex-profile run [profile] [-- <codex args...>]
 codex-profile <profile> [-- <codex args...>]
 ```
@@ -147,6 +154,7 @@ codex-profile <profile> [-- <codex args...>]
 - `codex-profile save <profile>` snapshots the account already active in `~/.codex/auth.json`.
 - `codex-profile login <profile>` always uses `codex login --device-auth`.
 - Auto-switch applies only to `codex-profile run` without an explicit profile.
+- `codex-profile config tui` requires `whiptail` to be installed.
 - This tool imports legacy auth automatically from `~/.codex-profiles/<profile>/auth.json` if present.
 - This tool does not modify a running Codex process. If you already have a Codex session open, start a new one with the desired profile.
 
