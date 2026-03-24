@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+shopt -s nullglob
+
+PROGRAM="${0##*/}"
+CODEX_BIN="${CODEX_BIN:-codex}"
+PROFILE_ROOT="${CODEX_PROFILE_ROOT:-$HOME/.codex-profiles}"
+DEFAULT_FILE="${CODEX_PROFILE_DEFAULT_FILE:-$PROFILE_ROOT/.default-profile}"
+BASE_CONFIG_SOURCE="${CODEX_BASE_CONFIG_SOURCE:-$HOME/.codex/config.toml}"
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+note() {
+  printf '%s\n' "$*"
+}
+
+usage() {
+  cat <<EOF
+$PROGRAM - simple profile manager for Codex accounts
+
+Usage:
+  $PROGRAM help
+  $PROGRAM list
+  $PROGRAM current
+  $PROGRAM use <profile>
+  $PROGRAM path <profile>
+  $PROGRAM login <profile>
+  $PROGRAM status [profile]
+  $PROGRAM run [profile] [-- <codex args...>]
+  $PROGRAM <profile> [-- <codex args...>]
+
+Commands:
+  list
+      List saved profiles from $PROFILE_ROOT.
+
+  current
+      Show the default profile.
+
+  use <profile>
+      Set the default profile.
+
+  path <profile>
+      Print the CODEX_HOME directory for a profile.
+
+  login <profile>
+      Run 'codex login' using that profile's CODEX_HOME.
+
+  status [profile]
+      Show 'codex login status' for a profile.
+      If omitted, uses the default profile.
+
+  run [profile] [-- <codex args...>]
+      Run Codex with the selected profile's CODEX_HOME.
+      If profile is omitted, uses the default profile.
+
+  <profile> [-- <codex args...>]
+      Shorthand for '$PROGRAM run <profile> [-- <codex args...>]'.
+
+Notes:
+  - Each profile gets its own isolated CODEX_HOME under $PROFILE_ROOT.
+  - This keeps auth, sessions, history, and config separate per account.
+  - On first use, config.toml is copied from $BASE_CONFIG_SOURCE if present.
+
+Examples:
+  $PROGRAM login personal
+  $PROGRAM login work
+  $PROGRAM use work
+  $PROGRAM run
+  $PROGRAM run personal -- resume --last
+  $PROGRAM work
+EOF
+}
+
+ensure_root() {
+  mkdir -p "$PROFILE_ROOT"
+  chmod 700 "$PROFILE_ROOT" 2>/dev/null || true
+}
+
+validate_profile_name() {
+  local profile="${1:-}"
+
+  [[ -n "$profile" ]] || die "Profile name is required."
+
+  if [[ ! "$profile" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    die "Invalid profile '$profile'. Use letters, numbers, dots, dashes, or underscores."
+  fi
+}
+
+profile_dir() {
+  local profile="$1"
+  printf '%s/%s\n' "$PROFILE_ROOT" "$profile"
+}
+
+profile_config() {
+  local profile="$1"
+  printf '%s/config.toml\n' "$(profile_dir "$profile")"
+}
+
+set_default_profile() {
+  local profile="$1"
+
+  printf '%s\n' "$profile" >"$DEFAULT_FILE"
+  chmod 600 "$DEFAULT_FILE" 2>/dev/null || true
+}
+
+get_default_profile() {
+  [[ -f "$DEFAULT_FILE" ]] || return 1
+
+  local profile=""
+  IFS= read -r profile <"$DEFAULT_FILE" || true
+  [[ -n "$profile" ]] || return 1
+  validate_profile_name "$profile"
+  printf '%s\n' "$profile"
+}
+
+ensure_profile_dir() {
+  local profile="$1"
+  local dir
+
+  dir="$(profile_dir "$profile")"
+  mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
+}
+
+bootstrap_config() {
+  local profile="$1"
+  local target tmp_file
+
+  target="$(profile_config "$profile")"
+  [[ -f "$target" ]] && return 0
+  [[ -f "$BASE_CONFIG_SOURCE" ]] || return 0
+
+  tmp_file="$(mktemp "${target}.tmp.XXXXXX")"
+  cp "$BASE_CONFIG_SOURCE" "$tmp_file"
+  chmod 600 "$tmp_file" 2>/dev/null || true
+  mv "$tmp_file" "$target"
+}
+
+resolve_profile() {
+  local requested="${1:-}"
+
+  if [[ -n "$requested" ]]; then
+    validate_profile_name "$requested"
+    printf '%s\n' "$requested"
+    return 0
+  fi
+
+  get_default_profile || die "No default profile set. Run '$PROGRAM use <profile>' or pass a profile explicitly."
+}
+
+list_profiles() {
+  ensure_root
+
+  local default_profile profile_path profile_name found=0 marker=" "
+  default_profile="$(get_default_profile || true)"
+
+  for profile_path in "$PROFILE_ROOT"/*; do
+    [[ -d "$profile_path" ]] || continue
+    profile_name="${profile_path##*/}"
+    validate_profile_name "$profile_name"
+    found=1
+    marker=" "
+    [[ "$profile_name" == "$default_profile" ]] && marker="*"
+    printf '%s %s\n' "$marker" "$profile_name"
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    note "No Codex profiles saved yet."
+    return 0
+  fi
+
+  if [[ -n "$default_profile" ]]; then
+    note ""
+    note "* default profile"
+  fi
+}
+
+command_current() {
+  local profile
+  profile="$(get_default_profile || true)"
+
+  if [[ -n "$profile" ]]; then
+    note "$profile"
+  else
+    note "No default profile set."
+  fi
+}
+
+command_use() {
+  local profile="${1:-}"
+  validate_profile_name "$profile"
+  ensure_root
+  ensure_profile_dir "$profile"
+  bootstrap_config "$profile"
+  set_default_profile "$profile"
+  note "Default profile set to '$profile'."
+}
+
+command_path() {
+  local profile="${1:-}"
+  validate_profile_name "$profile"
+  ensure_root
+  note "$(profile_dir "$profile")"
+}
+
+command_login() {
+  local profile="${1:-}"
+  local dir
+
+  validate_profile_name "$profile"
+  ensure_root
+  ensure_profile_dir "$profile"
+  bootstrap_config "$profile"
+  dir="$(profile_dir "$profile")"
+
+  note "Using CODEX_HOME=$dir"
+  CODEX_HOME="$dir" "$CODEX_BIN" login
+}
+
+command_status() {
+  local profile dir
+
+  profile="$(resolve_profile "${1:-}")"
+  ensure_root
+  ensure_profile_dir "$profile"
+  bootstrap_config "$profile"
+  dir="$(profile_dir "$profile")"
+
+  CODEX_HOME="$dir" "$CODEX_BIN" login status
+}
+
+command_run() {
+  local profile dir
+
+  if [[ "${1:-}" == "--" ]]; then
+    profile="$(resolve_profile "")"
+  elif [[ -n "${1:-}" ]]; then
+    profile="$(resolve_profile "$1")"
+    shift
+  else
+    profile="$(resolve_profile "")"
+  fi
+
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+
+  ensure_root
+  ensure_profile_dir "$profile"
+  bootstrap_config "$profile"
+  dir="$(profile_dir "$profile")"
+
+  exec env CODEX_HOME="$dir" "$CODEX_BIN" "$@"
+}
+
+main() {
+  local command="${1:-help}"
+  shift || true
+
+  case "$command" in
+    help|-h|--help)
+      usage
+      ;;
+    list)
+      list_profiles
+      ;;
+    current)
+      command_current
+      ;;
+    use)
+      command_use "$@"
+      ;;
+    path)
+      command_path "$@"
+      ;;
+    login)
+      command_login "$@"
+      ;;
+    status)
+      command_status "$@"
+      ;;
+    run)
+      command_run "$@"
+      ;;
+    *)
+      validate_profile_name "$command"
+      command_run "$command" "$@"
+      ;;
+  esac
+}
+
+main "$@"
