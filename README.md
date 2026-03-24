@@ -118,6 +118,7 @@ codex-profile config show
 Or edit it from a small terminal UI:
 
 ```bash
+codex-profile setup
 codex-profile config tui
 ```
 
@@ -144,6 +145,7 @@ Explicit profile runs such as `codex-profile melmacia2` do not auto-switch away.
 codex-profile list
 codex-profile limits
 codex-profile limits refresh [profile]
+codex-profile setup
 codex-profile current
 codex-profile use <profile>
 codex-profile path <profile>
@@ -163,6 +165,7 @@ codex-profile <profile> [-- <codex args...>]
 - Cached per-profile limits are stored in `~/.codex/.codex-profile/limits`.
 - `codex-profile limits` shows the last known weekly/5-hour values per profile.
 - `codex-profile limits refresh` forces a live refresh before showing the table.
+- `codex-profile setup` opens the same TUI as `codex-profile config tui`.
 - The live auth file remains `~/.codex/auth.json`.
 - Auto-switch config is stored in `~/.codex/.codex-profile/config.toml`.
 - Profile names accept letters, numbers, dots, dashes, and underscores.

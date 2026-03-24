@@ -56,6 +56,7 @@ Usage:
   $PROGRAM list
   $PROGRAM limits
   $PROGRAM limits refresh [profile]
+  $PROGRAM setup
   $PROGRAM current
   $PROGRAM use <profile>
   $PROGRAM path <profile>
@@ -75,6 +76,9 @@ Commands:
   limits
       Show the last known weekly and 5-hour limits cached for each saved profile.
       Use 'limits refresh [profile]' to force a live refresh first.
+
+  setup
+      Open the interactive setup TUI. Alias for '$PROGRAM config tui'.
 
   current
       Show the default profile.
@@ -124,6 +128,7 @@ Commands:
 Examples:
   $PROGRAM save melmacia1
   $PROGRAM login melmacia2
+  $PROGRAM setup
   $PROGRAM limits
   $PROGRAM limits refresh
   $PROGRAM limits refresh melmacia2
@@ -1291,6 +1296,10 @@ command_config() {
   esac
 }
 
+command_setup() {
+  command_config_tui "$@"
+}
+
 command_run() {
   local profile="${1:-}"
   local args=()
@@ -1343,6 +1352,9 @@ main() {
       ;;
     limits)
       command_limits "$@"
+      ;;
+    setup)
+      command_setup "$@"
       ;;
     current)
       command_current "$@"
