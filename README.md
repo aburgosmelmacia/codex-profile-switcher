@@ -44,6 +44,20 @@ ln -sfn ~/codex-profile-switcher/bin/codex-profile ~/.local/bin/codex-profile
 
 Make sure `~/.local/bin` is on your `PATH`.
 
+If you want the visible `codex` command to launch through this tool safely:
+
+```bash
+codex-profile install-wrapper
+```
+
+That command creates:
+
+- `~/.local/bin/codex` as a generated wrapper that calls `codex-profile run`
+- `~/.local/bin/codex-real` as a preserved handle to the real Codex CLI
+
+This is intentionally a wrapper, not a direct symlink to `codex-profile`, so
+internal calls do not recurse back into the switcher.
+
 Dependencies:
 
 - `jq` is required for live limit refresh and auto-switch.
@@ -70,6 +84,7 @@ Typical first-time flow when one account is already active:
 codex-profile save personal
 codex-profile login work
 codex-profile use personal
+codex-profile install-wrapper
 codex-profile setup
 ```
 
@@ -89,6 +104,12 @@ Run Codex with the default profile:
 
 ```bash
 codex-profile run
+```
+
+Or, after installing the wrapper:
+
+```bash
+codex
 ```
 
 Run Codex with an explicit profile:
@@ -168,6 +189,7 @@ Explicit profile runs such as `codex-profile melmacia2` do not auto-switch away.
 ## Commands
 
 ```text
+codex-profile install-wrapper [--force] [--wrapper-path PATH] [--real-path PATH] [--codex-bin PATH]
 codex-profile list
 codex-profile limits
 codex-profile limits refresh [profile]
@@ -192,6 +214,7 @@ codex-profile <profile> [-- <codex args...>]
 - `codex-profile limits` shows the last known weekly/5-hour values per profile.
 - `codex-profile limits refresh` forces a live refresh before showing the table.
 - `codex-profile setup` opens the same TUI as `codex-profile config tui`.
+- `codex-profile install-wrapper` creates a safe `codex` wrapper plus `codex-real`.
 - The live auth file remains `~/.codex/auth.json`.
 - Auto-switch config is stored in `~/.codex/.codex-profile/config.toml`.
 - Profile names accept letters, numbers, dots, dashes, and underscores.
@@ -201,6 +224,7 @@ codex-profile <profile> [-- <codex args...>]
 - `codex-profile config tui` requires `whiptail` to be installed.
 - This tool imports legacy auth automatically from `~/.codex-profiles/<profile>/auth.json` if present.
 - This tool does not modify a running Codex process. If you already have a Codex session open, start a new one with the desired profile.
+- Use `codex-profile install-wrapper --force` if you intentionally want to replace an existing `codex` wrapper or `codex-real` link.
 
 ## Security
 
