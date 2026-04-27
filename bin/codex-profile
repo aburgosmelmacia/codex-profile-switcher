@@ -1495,7 +1495,6 @@ command_run() {
   local args=()
   local explicit_profile=0
   local selected_profile
-  local started_epoch
   local exit_status=0
 
   if [[ "${1:-}" == "--" ]]; then
@@ -1523,9 +1522,7 @@ command_run() {
   fi
 
   switch_profile "$selected_profile"
-  started_epoch="$(date +%s)"
   env CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" "${args[@]}" || exit_status=$?
-  update_limits_cache_from_recent_sessions "$selected_profile" "$started_epoch"
   return "$exit_status"
 }
 
