@@ -176,7 +176,7 @@ Behavior:
 - if it is above threshold, it stays active
 - if it falls below threshold, the tool refreshes the other saved profiles and compares them
 - selection prefers higher weekly remaining first, then higher 5-hour remaining
-- after each `codex-profile run`, the selected profile's cache is refreshed from the latest session files
+- limit caches are refreshed from isolated live probes, not from the shared session history
 - if a live probe fails, the tool falls back to the last cached limits for that profile
 
 Trade-offs:
