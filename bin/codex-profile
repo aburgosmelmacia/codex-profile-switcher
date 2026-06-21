@@ -5,6 +5,7 @@ shopt -s nullglob extglob
 
 PROGRAM="${0##*/}"
 CODEX_BIN="${CODEX_BIN:-codex}"
+PI_BIN="${PI_BIN:-pi}"
 SHARED_CODEX_HOME="${CODEX_SHARED_HOME:-${CODEX_HOME:-$HOME/.codex}}"
 AUTH_FILE="${AUTH_FILE:-$SHARED_CODEX_HOME/auth.json}"
 PROFILE_STORE="${CODEX_PROFILE_STORE:-$SHARED_CODEX_HOME/.codex-profile}"
@@ -17,6 +18,9 @@ PROBE_ROOT="${CODEX_PROFILE_PROBE_ROOT:-$PROFILE_STORE/probes}"
 LEGACY_PROFILE_ROOT="${CODEX_LEGACY_PROFILE_ROOT:-$HOME/.codex-profiles}"
 LIVE_PROBE_TIMEOUT_SECONDS="${CODEX_PROFILE_LIVE_PROBE_TIMEOUT_SECONDS:-25}"
 DEBUG_MODE="${CODEX_PROFILE_DEBUG:-0}"
+PI_AUTH_FILE="${PI_AUTH_FILE:-$HOME/.pi/agent/auth.json}"
+PI_PROVIDER="openai-codex"
+TOKEN_LIFETIME_DAYS="${TOKEN_LIFETIME_DAYS:-10}"
 
 AUTO_SWITCH_ENABLED_DEFAULT="false"
 AUTO_SWITCH_WEEKLY_THRESHOLD_DEFAULT="20"
@@ -114,6 +118,10 @@ Usage:
   $PROGRAM config show
   $PROGRAM config set <key> <value>
   $PROGRAM config tui
+  $PROGRAM pi save <profile>
+  $PROGRAM pi use <profile>
+  $PROGRAM pi run [profile] [-- <pi args...>]
+  $PROGRAM pi login <profile>
   $PROGRAM run [profile] [-- <codex args...>]
   $PROGRAM <profile> [-- <codex args...>]
 
@@ -169,6 +177,18 @@ Commands:
       Open a small whiptail-based TUI to edit auto-switch config and the default
       profile.
 
+  pi save <profile>
+      Save the current Pi openai-codex auth block as the named profile.
+
+  pi use <profile>
+      Restore the selected Codex profile and Pi openai-codex auth block.
+
+  pi run [profile] [-- <pi args...>]
+      Restore the selected profile for Codex and Pi, then run Pi.
+
+  pi login <profile>
+      Explain the manual Pi OAuth flow, then point to 'pi save'.
+
   run [profile] [-- <codex args...>]
       Restore the selected profile's auth.json into the shared CODEX_HOME and
       run Codex there. Sessions, skills, history, and config remain shared.
@@ -190,6 +210,8 @@ Examples:
   $PROGRAM config tui
   $PROGRAM config set auto_switch.enabled true
   $PROGRAM config set auto_switch.weekly_threshold_percent 20
+  $PROGRAM pi save melmacia1
+  $PROGRAM pi run melmacia1
   $PROGRAM run
   $PROGRAM melmacia2 -- resume --last
 EOF
@@ -254,6 +276,11 @@ validate_fallback() {
 account_path() {
   local profile="$1"
   printf '%s/%s.auth.json\n' "$ACCOUNTS_HOME" "$profile"
+}
+
+pi_account_path() {
+  local profile="$1"
+  printf '%s/%s.pi-auth.json\n' "$ACCOUNTS_HOME" "$profile"
 }
 
 legacy_auth_path() {
@@ -341,6 +368,10 @@ require_live_auth() {
   [[ -f "$AUTH_FILE" ]] || die "No live auth file found at $AUTH_FILE. Run '$PROGRAM login <profile>' first."
 }
 
+require_pi_auth() {
+  [[ -f "$PI_AUTH_FILE" ]] || die "No Pi auth file found at $PI_AUTH_FILE. Run Pi login first, then '$PROGRAM pi save <profile>'."
+}
+
 save_live_auth_as_profile() {
   local profile="$1"
 
@@ -356,6 +387,143 @@ restore_profile_auth() {
   source="$(account_path "$profile")"
   [[ -f "$source" ]] || die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
   copy_file_secure "$source" "$AUTH_FILE"
+}
+
+save_pi_auth_as_profile() {
+  local profile="$1"
+  local target
+
+  require_pi_auth
+  target="$(pi_account_path "$profile")"
+  python3 - "$PI_AUTH_FILE" "$target" "$PI_PROVIDER" <<'PY'
+import json, os, sys, tempfile
+source, target, provider = sys.argv[1:]
+with open(source, encoding="utf-8") as f:
+    data = json.load(f)
+block = data.get(provider)
+if not isinstance(block, dict):
+    raise SystemExit(f"Missing {provider} auth block in {source}")
+os.makedirs(os.path.dirname(target), exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(target) + ".tmp.", dir=os.path.dirname(target))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({provider: block}, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
+
+validate_pi_auth_snapshot() {
+  local profile="$1"
+  local source
+
+  source="$(pi_account_path "$profile")"
+  [[ -f "$source" ]] || die "Unknown Pi auth profile '$profile'. Run '$PROGRAM pi save $profile' first."
+  python3 - "$source" "$PI_PROVIDER" <<'PY'
+import json, sys
+source_path, provider = sys.argv[1:]
+with open(source_path, encoding="utf-8") as f:
+    saved = json.load(f)
+if not isinstance(saved.get(provider), dict):
+    raise SystemExit(f"Missing {provider} auth block in {source_path}")
+PY
+}
+
+restore_pi_auth() {
+  local profile="$1"
+  local source
+
+  source="$(pi_account_path "$profile")"
+  validate_pi_auth_snapshot "$profile"
+  mkdir -p "$(dirname "$PI_AUTH_FILE")"
+  python3 - "$PI_AUTH_FILE" "$source" "$PI_PROVIDER" <<'PY'
+import json, os, sys, tempfile
+live_path, source_path, provider = sys.argv[1:]
+if os.path.exists(live_path):
+    with open(live_path, encoding="utf-8") as f:
+        live = json.load(f)
+else:
+    live = {}
+with open(source_path, encoding="utf-8") as f:
+    saved = json.load(f)
+block = saved.get(provider)
+if not isinstance(block, dict):
+    raise SystemExit(f"Missing {provider} auth block in {source_path}")
+live[provider] = block
+os.makedirs(os.path.dirname(live_path), exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(live_path) + ".tmp.", dir=os.path.dirname(live_path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(live, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, live_path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
+
+save_pi_auth_from_codex_profile() {
+  local profile="$1"
+  local source target
+
+  source="$(account_path "$profile")"
+  target="$(pi_account_path "$profile")"
+  [[ -f "$source" ]] || die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
+  python3 - "$source" "$target" "$PI_PROVIDER" "$TOKEN_LIFETIME_DAYS" <<'PY'
+import datetime as dt, json, os, sys, tempfile
+source, target, provider, lifetime_days = sys.argv[1:]
+with open(source, encoding="utf-8") as f:
+    codex = json.load(f)
+tokens = codex.get("tokens") or {}
+try:
+    expires = int(tokens.get("expires_at") or ((dt.datetime.now(dt.timezone.utc).timestamp() + int(lifetime_days) * 86400))) * 1000
+except ValueError:
+    raise SystemExit("TOKEN_LIFETIME_DAYS must be an integer")
+block = {
+    "type": "oauth",
+    "access": tokens.get("access_token"),
+    "refresh": tokens.get("refresh_token"),
+    "expires": expires,
+    "accountId": tokens.get("account_id"),
+}
+missing = [k for k, v in block.items() if k != "type" and not v]
+if missing:
+    raise SystemExit("Missing Codex token fields: " + ", ".join(missing))
+os.makedirs(os.path.dirname(target), exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(target) + ".tmp.", dir=os.path.dirname(target))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({provider: block}, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
+
+switch_pi_profile() {
+  local target="$1"
+
+  validate_pi_auth_snapshot "$target"
+  switch_profile "$target"
+  restore_pi_auth "$target"
 }
 
 match_live_profile() {
@@ -1466,6 +1634,84 @@ command_config_tui() {
   done
 }
 
+command_pi() {
+  local subcommand="${1:-help}"
+  shift || true
+
+  case "$subcommand" in
+    save)
+      local profile="${1:-}"
+      validate_profile_name "$profile"
+      ensure_dirs
+      save_pi_auth_as_profile "$profile"
+      note "Saved Pi auth as '$profile'."
+      ;;
+    use)
+      local profile="${1:-}"
+      validate_profile_name "$profile"
+      ensure_dirs
+      switch_pi_profile "$profile"
+      note "Restored Codex and Pi auth for '$profile'."
+      ;;
+    run)
+      command_pi_run "$@"
+      ;;
+    login)
+      local profile="${1:-}"
+      validate_profile_name "$profile"
+      note "Pi OAuth is interactive. Run 'pi' and complete login, then run: $PROGRAM pi save $profile"
+      ;;
+    convert)
+      local profile="${1:-}"
+      validate_profile_name "$profile"
+      ensure_dirs
+      save_pi_auth_from_codex_profile "$profile"
+      note "Converted Codex auth snapshot to Pi auth for '$profile'."
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      die "Unknown pi command '$subcommand'. Use: save, use, run, login, convert."
+      ;;
+  esac
+}
+
+command_pi_run() {
+  local profile="${1:-}"
+  local args=()
+  local explicit_profile=0
+  local selected_profile
+  local exit_status=0
+
+  if [[ "${1:-}" == "--" ]]; then
+    profile=""
+  elif [[ -n "${1:-}" ]]; then
+    profile="$(resolve_profile "$1")"
+    explicit_profile=1
+    shift
+  else
+    profile=""
+  fi
+
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+
+  args=("$@")
+  ensure_dirs
+
+  if [[ "$explicit_profile" -eq 1 ]]; then
+    selected_profile="$profile"
+  else
+    selected_profile="$(effective_run_profile "")"
+  fi
+
+  switch_pi_profile "$selected_profile"
+  "$PI_BIN" "${args[@]}" || exit_status=$?
+  return "$exit_status"
+}
+
 command_config() {
   local subcommand="${1:-show}"
   shift || true
@@ -1566,6 +1812,9 @@ main() {
       ;;
     config)
       command_config "$@"
+      ;;
+    pi)
+      command_pi "$@"
       ;;
     run)
       command_run "$@"
