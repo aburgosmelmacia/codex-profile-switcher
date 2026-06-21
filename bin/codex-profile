@@ -1262,51 +1262,39 @@ command_save() {
   note "Saved live auth as '$profile'."
 }
 
-save_auth_symlink_target() {
-  local auth_symlink_target_file="$PROFILE_STORE/.auth-symlink-target"
-
-  if [[ -L "$AUTH_FILE" ]]; then
-    readlink -f "$AUTH_FILE" 2>/dev/null >"$auth_symlink_target_file" || rm -f "$auth_symlink_target_file"
+login_codex_bin() {
+  if [[ -n "${CODEX_LOGIN_BIN:-}" ]]; then
+    printf '%s\n' "$CODEX_LOGIN_BIN"
+  elif command -v codex-real >/dev/null 2>&1; then
+    command -v codex-real
   else
-    rm -f "$auth_symlink_target_file"
+    printf '%s\n' "$CODEX_BIN"
   fi
-}
-
-restore_auth_symlink_if_needed() {
-  local auth_symlink_target_file="$PROFILE_STORE/.auth-symlink-target"
-  local saved_target
-
-  [[ -f "$auth_symlink_target_file" ]] || return 0
-  IFS= read -r saved_target <"$auth_symlink_target_file" || return 0
-  [[ -n "$saved_target" ]] || return 0
-
-  if [[ -L "$AUTH_FILE" ]]; then
-    rm -f "$auth_symlink_target_file"
-    return 0
-  fi
-
-  if [[ -f "$AUTH_FILE" && ! -L "$AUTH_FILE" ]]; then
-    copy_file_secure "$AUTH_FILE" "$saved_target"
-    rm -f "$AUTH_FILE"
-    ln -s "$saved_target" "$AUTH_FILE"
-  fi
-
-  rm -f "$auth_symlink_target_file"
 }
 
 command_login() {
   local profile="${1:-}"
+  local login_home login_bin source exit_status
 
   validate_profile_name "$profile"
   ensure_dirs
 
-  note "Using shared CODEX_HOME=$SHARED_CODEX_HOME"
-  save_auth_symlink_target
-  CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" login --device-auth
-  save_live_auth_as_profile "$profile"
-  restore_auth_symlink_if_needed
-  set_current_profile "$profile"
-  note "Saved live auth as '$profile'."
+  login_home="$(mktemp -d "$PROFILE_STORE/login-$profile.XXXXXX")"
+  chmod 700 "$login_home" 2>/dev/null || true
+  login_bin="$(login_codex_bin)"
+
+  note "Using isolated CODEX_HOME=$login_home"
+  if CODEX_HOME="$login_home" "$login_bin" login --device-auth; then
+    source="$login_home/auth.json"
+    [[ -f "$source" ]] || { rm -rf "$login_home"; die "Login completed but no auth.json was created in isolated CODEX_HOME."; }
+    copy_file_secure "$source" "$(account_path "$profile")"
+    rm -rf "$login_home"
+    note "Saved login auth as '$profile'. Live auth unchanged. Run '$PROGRAM use $profile' to activate it."
+  else
+    exit_status=$?
+    rm -rf "$login_home"
+    return "$exit_status"
+  fi
 }
 
 command_status() {

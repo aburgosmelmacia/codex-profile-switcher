@@ -81,6 +81,7 @@ If you are starting from scratch and want to name two accounts directly:
 ```bash
 codex-profile login personal
 codex-profile login work
+codex-profile use personal
 ```
 
 Typical first-time flow when one account is already active:
@@ -93,11 +94,7 @@ codex-profile install-wrapper
 codex-profile setup
 ```
 
-Under the hood, those commands run:
-
-```bash
-CODEX_HOME=~/.codex codex login --device-auth
-```
+Under the hood, `login` runs Codex device auth in an isolated temporary `CODEX_HOME`, saves only the resulting `auth.json` snapshot, and leaves the live shared auth unchanged until you run `use` or `run`.
 
 Optionally set a default profile:
 
@@ -249,7 +246,7 @@ Useful commands:
 - Auto-switch config is stored in `~/.codex/.codex-profile/config.toml`.
 - Profile names accept letters, numbers, dots, dashes, and underscores.
 - `codex-profile save <profile>` snapshots the account already active in `~/.codex/auth.json`.
-- `codex-profile login <profile>` always uses `codex login --device-auth`.
+- `codex-profile login <profile>` uses isolated `codex login --device-auth`, saves `<profile>.auth.json`, and does not modify the live auth.
 - Pi auth snapshots are stored beside Codex snapshots as `<profile>.pi-auth.json`.
 - Auto-switch applies only to `codex-profile run`/`codex-profile pi run` without an explicit profile.
 - `codex-profile config tui` requires `whiptail` to be installed.
