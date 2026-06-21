@@ -1286,6 +1286,7 @@ restore_auth_symlink_if_needed() {
   fi
 
   if [[ -f "$AUTH_FILE" && ! -L "$AUTH_FILE" ]]; then
+    copy_file_secure "$AUTH_FILE" "$saved_target"
     rm -f "$AUTH_FILE"
     ln -s "$saved_target" "$AUTH_FILE"
   fi
@@ -1302,8 +1303,8 @@ command_login() {
   note "Using shared CODEX_HOME=$SHARED_CODEX_HOME"
   save_auth_symlink_target
   CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" login --device-auth
-  save_live_auth_as_profile "$profile"
   restore_auth_symlink_if_needed
+  save_live_auth_as_profile "$profile"
   set_current_profile "$profile"
   note "Saved live auth as '$profile'."
 }
