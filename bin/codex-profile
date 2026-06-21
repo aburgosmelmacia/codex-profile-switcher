@@ -1303,8 +1303,8 @@ command_login() {
   note "Using shared CODEX_HOME=$SHARED_CODEX_HOME"
   save_auth_symlink_target
   CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" login --device-auth
-  restore_auth_symlink_if_needed
   save_live_auth_as_profile "$profile"
+  restore_auth_symlink_if_needed
   set_current_profile "$profile"
   note "Saved live auth as '$profile'."
 }
