@@ -1262,6 +1262,38 @@ command_save() {
   note "Saved live auth as '$profile'."
 }
 
+save_auth_symlink_target() {
+  local auth_symlink_target_file="$PROFILE_STORE/.auth-symlink-target"
+
+  if [[ -L "$AUTH_FILE" ]]; then
+    readlink -f "$AUTH_FILE" 2>/dev/null >"$auth_symlink_target_file" || rm -f "$auth_symlink_target_file"
+  else
+    rm -f "$auth_symlink_target_file"
+  fi
+}
+
+restore_auth_symlink_if_needed() {
+  local auth_symlink_target_file="$PROFILE_STORE/.auth-symlink-target"
+  local saved_target
+
+  [[ -f "$auth_symlink_target_file" ]] || return 0
+  IFS= read -r saved_target <"$auth_symlink_target_file" || return 0
+  [[ -n "$saved_target" ]] || return 0
+
+  if [[ -L "$AUTH_FILE" ]]; then
+    rm -f "$auth_symlink_target_file"
+    return 0
+  fi
+
+  if [[ -f "$AUTH_FILE" && ! -L "$AUTH_FILE" ]]; then
+    copy_file_secure "$AUTH_FILE" "$saved_target"
+    rm -f "$AUTH_FILE"
+    ln -s "$saved_target" "$AUTH_FILE"
+  fi
+
+  rm -f "$auth_symlink_target_file"
+}
+
 command_login() {
   local profile="${1:-}"
 
@@ -1269,7 +1301,9 @@ command_login() {
   ensure_dirs
 
   note "Using shared CODEX_HOME=$SHARED_CODEX_HOME"
+  save_auth_symlink_target
   CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" login --device-auth
+  restore_auth_symlink_if_needed
   save_live_auth_as_profile "$profile"
   set_current_profile "$profile"
   note "Saved live auth as '$profile'."
