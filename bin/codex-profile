@@ -1286,6 +1286,7 @@ restore_auth_symlink_if_needed() {
   fi
 
   if [[ -f "$AUTH_FILE" && ! -L "$AUTH_FILE" ]]; then
+    copy_file_secure "$AUTH_FILE" "$saved_target"
     rm -f "$AUTH_FILE"
     ln -s "$saved_target" "$AUTH_FILE"
   fi
