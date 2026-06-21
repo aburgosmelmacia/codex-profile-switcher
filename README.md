@@ -10,12 +10,17 @@ workspace.
 - one shared set of skills
 - one shared config/history/cache
 - one saved `auth.json` snapshot per account
+- optionally, one saved Pi `openai-codex` auth snapshot per account
 
 The `login` command in this tool always uses Codex device auth, and the `run`
 command swaps the live `auth.json` before launching Codex.
 
 It can also auto-switch between saved profiles when the active one falls below
 configured weekly or 5-hour thresholds.
+
+For Pi agent, `codex-profile pi ...` only swaps the `openai-codex` block in
+`~/.pi/agent/auth.json`; other providers such as DeepSeek or OpenRouter are left
+untouched.
 
 ## Why this approach
 
@@ -203,9 +208,33 @@ codex-profile status [profile]
 codex-profile config show
 codex-profile config set <key> <value>
 codex-profile config tui
+codex-profile pi save <profile>
+codex-profile pi use <profile>
+codex-profile pi run [profile] [-- <pi args...>]
+codex-profile pi login <profile>
+codex-profile pi convert <profile>
 codex-profile run [profile] [-- <codex args...>]
 codex-profile <profile> [-- <codex args...>]
 ```
+
+## Pi agent
+
+Pi uses its own OAuth file at `~/.pi/agent/auth.json`, so its first login is
+manual:
+
+```bash
+pi
+codex-profile pi save work
+codex-profile pi run work
+```
+
+Useful commands:
+
+- `codex-profile pi save <profile>` saves only the current `openai-codex` block.
+- `codex-profile pi use <profile>` restores Codex auth and Pi `openai-codex` auth.
+- `codex-profile pi run <profile>` restores both, then runs `pi`.
+- `codex-profile pi login <profile>` prints the manual-login reminder.
+- `codex-profile pi convert <profile>` creates a Pi snapshot from a saved Codex snapshot.
 
 ## Notes
 
@@ -220,7 +249,8 @@ codex-profile <profile> [-- <codex args...>]
 - Profile names accept letters, numbers, dots, dashes, and underscores.
 - `codex-profile save <profile>` snapshots the account already active in `~/.codex/auth.json`.
 - `codex-profile login <profile>` always uses `codex login --device-auth`.
-- Auto-switch applies only to `codex-profile run` without an explicit profile.
+- Pi auth snapshots are stored beside Codex snapshots as `<profile>.pi-auth.json`.
+- Auto-switch applies only to `codex-profile run`/`codex-profile pi run` without an explicit profile.
 - `codex-profile config tui` requires `whiptail` to be installed.
 - This tool imports legacy auth automatically from `~/.codex-profiles/<profile>/auth.json` if present.
 - This tool does not modify a running Codex process. If you already have a Codex session open, start a new one with the desired profile.
