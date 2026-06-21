@@ -330,12 +330,23 @@ get_recorded_current_profile() {
 copy_file_secure() {
   local source="$1"
   local destination="$2"
-  local tmp_file
+  local target tmp_file target_dir
 
-  tmp_file="$(mktemp "${destination}.tmp.XXXXXX")"
+  target="$destination"
+  if [[ -L "$destination" ]]; then
+    target="$(readlink -f "$destination")" || die "Unable to resolve symlink '$destination'."
+  fi
+
+  if [[ -e "$target" ]]; then
+    cp "$source" "$target"
+    return 0
+  fi
+
+  target_dir="$(dirname "$target")"
+  tmp_file="$(mktemp "$target_dir/.${target##*/}.tmp.XXXXXX")"
   cp "$source" "$tmp_file"
   chmod 600 "$tmp_file" 2>/dev/null || true
-  mv "$tmp_file" "$destination"
+  mv "$tmp_file" "$target"
 }
 
 import_legacy_profile_if_needed() {

@@ -245,6 +245,7 @@ Useful commands:
 - `codex-profile setup` opens the same TUI as `codex-profile config tui`.
 - `codex-profile install-wrapper` creates a safe `codex` wrapper plus `codex-real`.
 - The live auth file remains `~/.codex/auth.json`.
+- If `~/.codex/auth.json` is a symlink, profile restores update the symlink target and keep the symlink intact.
 - Auto-switch config is stored in `~/.codex/.codex-profile/config.toml`.
 - Profile names accept letters, numbers, dots, dashes, and underscores.
 - `codex-profile save <profile>` snapshots the account already active in `~/.codex/auth.json`.
