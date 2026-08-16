@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Consumer users receive access-only snapshots from the central sync service.
+# The profile manager must never save their live auth back into those snapshots.
+exec env \
+  CODEX_HOME="$HOME/.codex" \
+  CODEX_SHARED_HOME="$HOME/.codex" \
+  CODEX_PROFILE_CONSUMER=1 \
+  CODEX_BIN="$HOME/.local/bin/codex-real" \
+  /usr/local/bin/codex-profile run -- "$@"

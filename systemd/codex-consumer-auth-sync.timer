@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic fallback sync for Codex consumer credentials
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=codex-consumer-auth-sync.service
+
+[Install]
+WantedBy=timers.target

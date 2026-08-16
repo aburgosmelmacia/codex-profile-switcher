@@ -21,6 +21,8 @@ DEBUG_MODE="${CODEX_PROFILE_DEBUG:-0}"
 PI_AUTH_FILE="${PI_AUTH_FILE:-$HOME/.pi/agent/auth.json}"
 PI_PROVIDER="openai-codex"
 TOKEN_LIFETIME_DAYS="${TOKEN_LIFETIME_DAYS:-10}"
+CONSUMER_MODE="${CODEX_PROFILE_CONSUMER:-0}"
+CONSUMER_MARKER="${CODEX_PROFILE_CONSUMER_FILE:-$PROFILE_STORE/.consumer}"
 
 AUTO_SWITCH_ENABLED_DEFAULT="false"
 AUTO_SWITCH_WEEKLY_THRESHOLD_DEFAULT="20"
@@ -49,6 +51,18 @@ stderr_note() {
 debug_note() {
   [[ "$DEBUG_MODE" == "1" ]] || return 0
   printf '[debug] %s\n' "$*" >&2
+}
+
+is_consumer_mode() {
+  [[ "$CONSUMER_MODE" == "1" || "$CONSUMER_MODE" == "true" || -f "$CONSUMER_MARKER" ]]
+}
+
+deny_consumer_credential_write() {
+  local operation="$1"
+
+  if is_consumer_mode; then
+    die "'$operation' is disabled in consumer mode. Credentials are managed by the central writer."
+  fi
 }
 
 resolve_existing_path() {
@@ -122,6 +136,8 @@ Usage:
   $PROGRAM pi use <profile>
   $PROGRAM pi run [profile] [-- <pi args...>]
   $PROGRAM pi login <profile>
+  $PROGRAM pi convert <profile>
+  $PROGRAM pi sync <profile>
   $PROGRAM run [profile] [-- <codex args...>]
   $PROGRAM <profile> [-- <codex args...>]
 
@@ -188,6 +204,13 @@ Commands:
 
   pi login <profile>
       Explain the manual Pi OAuth flow, then point to 'pi save'.
+
+  pi convert <profile>
+      Rebuild the saved Pi auth snapshot from the saved Codex profile.
+
+  pi sync <profile>
+      Rebuild the Pi snapshot from Codex and update live Pi auth when the
+      profile is currently active.
 
   run [profile] [-- <codex args...>]
       Restore the selected profile's auth.json into the shared CODEX_HOME and
@@ -355,6 +378,7 @@ import_legacy_profile_if_needed() {
 
   target="$(account_path "$profile")"
   [[ -f "$target" ]] && return 0
+  is_consumer_mode && return 0
 
   legacy="$(legacy_auth_path "$profile")"
   [[ -f "$legacy" ]] || return 0
@@ -397,7 +421,46 @@ restore_profile_auth() {
   import_legacy_profile_if_needed "$profile"
   source="$(account_path "$profile")"
   [[ -f "$source" ]] || die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
-  copy_file_secure "$source" "$AUTH_FILE"
+  if is_consumer_mode; then
+    [[ ! -L "$AUTH_FILE" ]] || die "Consumer auth target '$AUTH_FILE' must not be a symlink."
+    python3 - "$source" "$AUTH_FILE" <<'PY'
+import json, os, sys, tempfile
+
+source, target = sys.argv[1:]
+with open(source, encoding="utf-8") as f:
+    auth = json.load(f)
+
+tokens = auth.get("tokens")
+if not isinstance(tokens, dict):
+    raise SystemExit(f"Missing tokens object in {source}")
+for field in ("access_token", "account_id"):
+    if not isinstance(tokens.get(field), str) or not tokens[field]:
+        raise SystemExit(f"Missing {field} in {source}")
+
+# Codex 0.147 accepts an empty refresh_token while the access token is valid.
+# Keeping the field preserves the expected schema without sharing a rotating
+# credential with consumer users.
+tokens["refresh_token"] = ""
+
+target_dir = os.path.dirname(target)
+os.makedirs(target_dir, mode=0o700, exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(target) + ".tmp.", dir=target_dir)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(auth, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+  else
+    copy_file_secure "$source" "$AUTH_FILE"
+  fi
 }
 
 save_pi_auth_as_profile() {
@@ -493,13 +556,34 @@ save_pi_auth_from_codex_profile() {
   target="$(pi_account_path "$profile")"
   [[ -f "$source" ]] || die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
   python3 - "$source" "$target" "$PI_PROVIDER" "$TOKEN_LIFETIME_DAYS" <<'PY'
-import datetime as dt, json, os, sys, tempfile
+import base64, binascii, datetime as dt, json, os, sys, tempfile
 source, target, provider, lifetime_days = sys.argv[1:]
 with open(source, encoding="utf-8") as f:
     codex = json.load(f)
 tokens = codex.get("tokens") or {}
+
+def jwt_expiry_ms(access_token):
+    try:
+        payload = access_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return int(claims["exp"]) * 1000
+    except (
+        AttributeError,
+        binascii.Error,
+        IndexError,
+        KeyError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return None
+
 try:
-    expires = int(tokens.get("expires_at") or ((dt.datetime.now(dt.timezone.utc).timestamp() + int(lifetime_days) * 86400))) * 1000
+    expires = jwt_expiry_ms(tokens.get("access_token"))
+    if expires is None:
+        expires = int(tokens.get("expires_at") or (dt.datetime.now(dt.timezone.utc).timestamp() + int(lifetime_days) * 86400)) * 1000
 except ValueError:
     raise SystemExit("TOKEN_LIFETIME_DAYS must be an integer")
 block = {
@@ -526,6 +610,39 @@ except Exception:
     except FileNotFoundError:
         pass
     raise
+PY
+}
+
+sync_pi_auth_from_codex_profile() {
+  local profile="$1"
+  local update_live=0
+
+  if pi_auth_matches_saved_profile "$profile"; then
+    update_live=1
+  fi
+  save_pi_auth_from_codex_profile "$profile"
+  if [[ "$update_live" -eq 1 ]]; then
+    restore_pi_auth "$profile"
+    note "Updated live Pi auth for active profile '$profile'."
+  else
+    note "Updated Pi auth snapshot for inactive profile '$profile'."
+  fi
+}
+
+pi_auth_matches_saved_profile() {
+  local profile="$1"
+  local saved
+
+  saved="$(pi_account_path "$profile")"
+  [[ -f "$PI_AUTH_FILE" && -f "$saved" ]] || return 1
+  python3 - "$PI_AUTH_FILE" "$saved" "$PI_PROVIDER" <<'PY'
+import json, sys
+live_path, saved_path, provider = sys.argv[1:]
+with open(live_path, encoding="utf-8") as f:
+    live = json.load(f)
+with open(saved_path, encoding="utf-8") as f:
+    saved = json.load(f)
+raise SystemExit(0 if live.get(provider) == saved.get(provider) else 1)
 PY
 }
 
@@ -584,15 +701,17 @@ switch_profile() {
   live_profile="$(match_live_profile || true)"
   recorded_profile="$(get_recorded_current_profile || true)"
 
-  if [[ "$live_profile" == "$target" ]]; then
+  if [[ "$live_profile" == "$target" ]] && ! is_consumer_mode; then
     set_current_profile "$target"
     return 0
   fi
 
-  if [[ -n "$live_profile" ]]; then
-    refresh_recorded_profile_snapshot "$live_profile"
-  elif [[ -n "$recorded_profile" ]]; then
-    refresh_recorded_profile_snapshot "$recorded_profile"
+  if ! is_consumer_mode; then
+    if [[ -n "$live_profile" ]]; then
+      refresh_recorded_profile_snapshot "$live_profile"
+    elif [[ -n "$recorded_profile" ]]; then
+      refresh_recorded_profile_snapshot "$recorded_profile"
+    fi
   fi
 
   restore_profile_auth "$target"
@@ -1240,6 +1359,9 @@ command_use() {
   validate_profile_name "$profile"
   ensure_dirs
   import_legacy_profile_if_needed "$profile"
+  if is_consumer_mode; then
+    [[ -f "$(account_path "$profile")" ]] || die "Unknown profile '$profile'."
+  fi
   set_default_profile "$profile"
   note "Default profile set to '$profile'."
 }
@@ -1255,6 +1377,7 @@ command_path() {
 command_save() {
   local profile="${1:-}"
 
+  deny_consumer_credential_write "save"
   validate_profile_name "$profile"
   ensure_dirs
   save_live_auth_as_profile "$profile"
@@ -1276,6 +1399,7 @@ command_login() {
   local profile="${1:-}"
   local login_home login_bin source exit_status
 
+  deny_consumer_credential_write "login"
   validate_profile_name "$profile"
   ensure_dirs
 
@@ -1671,6 +1795,8 @@ command_pi() {
   local subcommand="${1:-help}"
   shift || true
 
+  deny_consumer_credential_write "pi $subcommand"
+
   case "$subcommand" in
     save)
       local profile="${1:-}"
@@ -1701,11 +1827,17 @@ command_pi() {
       save_pi_auth_from_codex_profile "$profile"
       note "Converted Codex auth snapshot to Pi auth for '$profile'."
       ;;
+    sync)
+      local profile="${1:-}"
+      validate_profile_name "$profile"
+      ensure_dirs
+      sync_pi_auth_from_codex_profile "$profile"
+      ;;
     help|-h|--help)
       usage
       ;;
     *)
-      die "Unknown pi command '$subcommand'. Use: save, use, run, login, convert."
+      die "Unknown pi command '$subcommand'. Use: save, use, run, login, convert, sync."
       ;;
   esac
 }

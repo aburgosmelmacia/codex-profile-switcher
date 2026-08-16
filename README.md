@@ -210,9 +210,40 @@ codex-profile pi use <profile>
 codex-profile pi run [profile] [-- <pi args...>]
 codex-profile pi login <profile>
 codex-profile pi convert <profile>
+codex-profile pi sync <profile>
 codex-profile run [profile] [-- <codex args...>]
 codex-profile <profile> [-- <codex args...>]
 ```
+
+## Centrally managed consumer users
+
+Set `CODEX_PROFILE_CONSUMER=1`, or create the managed
+`~/.codex/.codex-profile/.consumer` marker, for users who may run centrally
+managed profiles but must never rotate or save their credentials. The central
+sync service creates that marker automatically. In consumer mode:
+
+- every restored `auth.json` keeps the access token and has an empty
+  `refresh_token`
+- the live auth is never written back into a saved profile
+- `save`, `login`, and all `pi` credential commands are rejected
+- `shared` and `secondary` remain selectable with `use` or an explicit `run`
+
+Do not point consumer homes at the central credential files with symlinks. Use
+`codex-consumer-auth-sync` as root to create private, access-only copies:
+
+```bash
+sudo install -m 0755 bin/codex-consumer-auth-sync /usr/local/sbin/
+sudo install -m 0644 systemd/codex-consumer-auth-sync.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now codex-consumer-auth-sync.path codex-consumer-auth-sync.timer
+sudo systemctl start codex-consumer-auth-sync.service
+```
+
+The generated consumer snapshots and live auth files are atomically replaced,
+owned by their target user, and mode `0600`. The default deployment distributes
+`shared` and `secondary` from `/home/alberto/.codex-auth-shared/accounts` to
+Andrés and Carlos. The service refuses expired sources, symlink targets, and
+invalid authentication JSON.
 
 ## Pi agent
 
@@ -232,6 +263,12 @@ Useful commands:
 - `codex-profile pi run <profile>` restores both, then runs `pi`.
 - `codex-profile pi login <profile>` prints the manual-login reminder.
 - `codex-profile pi convert <profile>` creates a Pi snapshot from a saved Codex snapshot.
+- `codex-profile pi sync <profile>` recreates that snapshot using the JWT's real expiry and also updates live Pi auth when the profile is active.
+
+`pi convert` and `pi sync` intentionally make Codex and Pi share one rotating OAuth
+credential. Use `pi sync` from a proactive refresh coordinator before token expiry;
+if Pi has independently changed its live credential, `pi sync` preserves that live
+credential and updates only the saved snapshot.
 
 ## Notes
 

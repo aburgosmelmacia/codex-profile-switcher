@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+
+"""Distribute access-only Codex auth snapshots to consumer user homes."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import json
+import os
+import pwd
+import stat
+import tempfile
+import time
+from pathlib import Path
+
+
+DEFAULT_SOURCE = Path("/home/alberto/.codex-auth-shared/accounts")
+DEFAULT_CONSUMERS = ("andres:/home/andres", "carlos:/home/carlos")
+DEFAULT_PROFILES = ("shared", "secondary")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Copy centrally managed Codex profiles without refresh tokens."
+    )
+    parser.add_argument("--source-dir", type=Path, default=DEFAULT_SOURCE)
+    parser.add_argument(
+        "--consumer",
+        action="append",
+        default=[],
+        metavar="USER:HOME",
+        help="Consumer account and home; repeat for multiple users.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="append",
+        default=[],
+        help="Allowed profile; repeat for multiple profiles.",
+    )
+    parser.add_argument("--minimum-ttl", type=int, default=300)
+    parser.add_argument(
+        "--lock-file", type=Path, default=Path("/run/lock/codex-consumer-auth-sync.lock")
+    )
+    parser.add_argument(
+        "--no-chown",
+        action="store_true",
+        help="Keep current ownership; intended only for isolated tests.",
+    )
+    return parser.parse_args()
+
+
+def jwt_expiry(access_token: str) -> int:
+    try:
+        payload = access_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return int(claims["exp"])
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("access token does not contain a valid JWT expiry") from exc
+
+
+def load_profile(source: Path, minimum_ttl: int) -> dict:
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(f"profile source must be a regular file: {source}")
+    with source.open(encoding="utf-8") as handle:
+        auth = json.load(handle)
+    tokens = auth.get("tokens")
+    if not isinstance(tokens, dict):
+        raise ValueError(f"missing tokens object: {source}")
+    for field in ("access_token", "refresh_token", "account_id"):
+        if not isinstance(tokens.get(field), str) or not tokens[field]:
+            raise ValueError(f"missing {field}: {source}")
+    expires_at = jwt_expiry(tokens["access_token"])
+    if expires_at <= int(time.time()) + minimum_ttl:
+        raise ValueError(f"access token expires too soon: {source}")
+    sanitized = json.loads(json.dumps(auth))
+    sanitized["tokens"]["refresh_token"] = ""
+    return sanitized
+
+
+def reject_symlink(path: Path) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(mode):
+        raise ValueError(f"refusing symlink target: {path}")
+
+
+def ensure_directory(path: Path, uid: int, gid: int, chown: bool) -> None:
+    reject_symlink(path)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not path.is_dir():
+        raise ValueError(f"not a directory: {path}")
+    os.chmod(path, 0o700)
+    if chown:
+        os.chown(path, uid, gid)
+
+
+def atomic_write(path: Path, content: bytes, uid: int, gid: int, chown: bool) -> None:
+    reject_symlink(path)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        if chown:
+            os.chown(temporary, uid, gid)
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def json_bytes(value: dict) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+
+
+def read_selected_profile(path: Path, allowed: tuple[str, ...], fallback: str) -> str:
+    reject_symlink(path)
+    try:
+        selected = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return fallback
+    return selected if selected in allowed else fallback
+
+
+def parse_consumer(specification: str, no_chown: bool) -> tuple[str, Path, int, int]:
+    try:
+        username, home_value = specification.split(":", 1)
+    except ValueError as exc:
+        raise ValueError(f"invalid consumer specification: {specification}") from exc
+    if not username or not home_value:
+        raise ValueError(f"invalid consumer specification: {specification}")
+    home = Path(home_value)
+    if not home.is_absolute():
+        raise ValueError(f"consumer home must be absolute: {home}")
+    if no_chown:
+        return username, home, os.getuid(), os.getgid()
+    account = pwd.getpwnam(username)
+    if Path(account.pw_dir) != home:
+        raise ValueError(f"home mismatch for {username}: expected {account.pw_dir}, got {home}")
+    return username, home, account.pw_uid, account.pw_gid
+
+
+def sync_consumer(
+    specification: str,
+    profiles: tuple[str, ...],
+    payloads: dict[str, dict],
+    no_chown: bool,
+) -> None:
+    username, home, uid, gid = parse_consumer(specification, no_chown)
+    codex_home = home / ".codex"
+    profile_store = codex_home / ".codex-profile"
+    accounts_home = profile_store / "accounts"
+    for directory in (codex_home, profile_store, accounts_home):
+        ensure_directory(directory, uid, gid, not no_chown)
+
+    for profile in profiles:
+        atomic_write(
+            accounts_home / f"{profile}.auth.json",
+            json_bytes(payloads[profile]),
+            uid,
+            gid,
+            not no_chown,
+        )
+
+    default_file = profile_store / ".default-profile"
+    current_file = profile_store / ".current-profile"
+    atomic_write(profile_store / ".consumer", b"central-access-only\n", uid, gid, not no_chown)
+    default_profile = read_selected_profile(default_file, profiles, "shared")
+    current_profile = read_selected_profile(current_file, profiles, default_profile)
+    if not default_file.exists() or default_file.read_text(encoding="utf-8").strip() not in profiles:
+        atomic_write(default_file, f"{default_profile}\n".encode(), uid, gid, not no_chown)
+    if not current_file.exists() or current_file.read_text(encoding="utf-8").strip() not in profiles:
+        atomic_write(current_file, f"{current_profile}\n".encode(), uid, gid, not no_chown)
+    atomic_write(
+        codex_home / "auth.json",
+        json_bytes(payloads[current_profile]),
+        uid,
+        gid,
+        not no_chown,
+    )
+    print(f"Synced access-only Codex profiles for {username}; active={current_profile}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.minimum_ttl < 0:
+        raise SystemExit("--minimum-ttl must be non-negative")
+    profiles = tuple(args.profile or DEFAULT_PROFILES)
+    if "shared" not in profiles:
+        raise SystemExit("the shared profile is required as the safe default")
+    if len(set(profiles)) != len(profiles):
+        raise SystemExit("duplicate profile")
+    for profile in profiles:
+        if not profile or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for character in profile):
+            raise SystemExit(f"invalid profile name: {profile}")
+    consumers = tuple(args.consumer or DEFAULT_CONSUMERS)
+
+    args.lock_file.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    with args.lock_file.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        payloads = {
+            profile: load_profile(args.source_dir / f"{profile}.auth.json", args.minimum_ttl)
+            for profile in profiles
+        }
+        for consumer in consumers:
+            sync_consumer(consumer, profiles, payloads, args.no_chown)
+
+
+if __name__ == "__main__":
+    main()
