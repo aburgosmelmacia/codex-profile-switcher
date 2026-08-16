@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch centrally managed Codex consumer profiles
+
+[Path]
+PathChanged=/home/alberto/.codex-auth-shared/accounts/shared.auth.json
+PathChanged=/home/alberto/.codex-auth-shared/accounts/secondary.auth.json
+Unit=codex-consumer-auth-sync.service
+
+[Install]
+WantedBy=multi-user.target

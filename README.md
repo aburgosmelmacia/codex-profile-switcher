@@ -215,6 +215,34 @@ codex-profile run [profile] [-- <codex args...>]
 codex-profile <profile> [-- <codex args...>]
 ```
 
+## Centrally managed consumer users
+
+Set `CODEX_PROFILE_CONSUMER=1` for users who may run centrally managed profiles
+but must never rotate or save their credentials. In consumer mode:
+
+- every restored `auth.json` keeps the access token and has an empty
+  `refresh_token`
+- the live auth is never written back into a saved profile
+- `save`, `login`, and all `pi` credential commands are rejected
+- `shared` and `secondary` remain selectable with `use` or an explicit `run`
+
+Do not point consumer homes at the central credential files with symlinks. Use
+`codex-consumer-auth-sync` as root to create private, access-only copies:
+
+```bash
+sudo install -m 0755 bin/codex-consumer-auth-sync /usr/local/sbin/
+sudo install -m 0644 systemd/codex-consumer-auth-sync.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now codex-consumer-auth-sync.path codex-consumer-auth-sync.timer
+sudo systemctl start codex-consumer-auth-sync.service
+```
+
+The generated consumer snapshots and live auth files are atomically replaced,
+owned by their target user, and mode `0600`. The default deployment distributes
+`shared` and `secondary` from `/home/alberto/.codex-auth-shared/accounts` to
+Andrés and Carlos. The service refuses expired sources, symlink targets, and
+invalid authentication JSON.
+
 ## Pi agent
 
 Pi uses its own OAuth file at `~/.pi/agent/auth.json`, so its first login is
