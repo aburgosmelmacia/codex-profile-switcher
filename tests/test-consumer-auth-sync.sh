@@ -44,6 +44,7 @@ for profile in shared secondary; do
 done
 jq -e '.tokens.refresh_token == "" and .tokens.account_id == "account-secondary"' \
   "$CONSUMER_HOME/.codex/auth.json" >/dev/null
+[[ "$(cat "$CONSUMER_HOME/.codex/.codex-profile/.consumer")" == "central-access-only" ]]
 [[ "$shared_before" == "$(sha256sum "$SOURCE/shared.auth.json")" ]]
 [[ "$secondary_before" == "$(sha256sum "$SOURCE/secondary.auth.json")" ]]
 

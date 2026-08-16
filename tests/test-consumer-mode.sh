@@ -44,6 +44,7 @@ cat >"$AUTH_FILE" <<'EOF'
 EOF
 printf '%s\n' shared >"$PROFILE_STORE/.default-profile"
 printf '%s\n' shared >"$PROFILE_STORE/.current-profile"
+printf '%s\n' central-access-only >"$PROFILE_STORE/.consumer"
 
 cat >"$FAKE_CODEX" <<'EOF'
 #!/usr/bin/env bash
@@ -64,7 +65,6 @@ consumer() {
   CODEX_PROFILE_DEFAULT_FILE="$PROFILE_STORE/.default-profile" \
   AUTH_FILE="$AUTH_FILE" \
   CODEX_BIN="$FAKE_CODEX" \
-  CODEX_PROFILE_CONSUMER=1 \
     "$ROOT/bin/codex-profile" "$@"
 }
 

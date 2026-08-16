@@ -217,8 +217,10 @@ codex-profile <profile> [-- <codex args...>]
 
 ## Centrally managed consumer users
 
-Set `CODEX_PROFILE_CONSUMER=1` for users who may run centrally managed profiles
-but must never rotate or save their credentials. In consumer mode:
+Set `CODEX_PROFILE_CONSUMER=1`, or create the managed
+`~/.codex/.codex-profile/.consumer` marker, for users who may run centrally
+managed profiles but must never rotate or save their credentials. The central
+sync service creates that marker automatically. In consumer mode:
 
 - every restored `auth.json` keeps the access token and has an empty
   `refresh_token`
