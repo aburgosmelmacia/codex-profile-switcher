@@ -122,6 +122,8 @@ Usage:
   $PROGRAM pi use <profile>
   $PROGRAM pi run [profile] [-- <pi args...>]
   $PROGRAM pi login <profile>
+  $PROGRAM pi convert <profile>
+  $PROGRAM pi sync <profile>
   $PROGRAM run [profile] [-- <codex args...>]
   $PROGRAM <profile> [-- <codex args...>]
 
@@ -188,6 +190,13 @@ Commands:
 
   pi login <profile>
       Explain the manual Pi OAuth flow, then point to 'pi save'.
+
+  pi convert <profile>
+      Rebuild the saved Pi auth snapshot from the saved Codex profile.
+
+  pi sync <profile>
+      Rebuild the Pi snapshot from Codex and update live Pi auth when the
+      profile is currently active.
 
   run [profile] [-- <codex args...>]
       Restore the selected profile's auth.json into the shared CODEX_HOME and
@@ -493,13 +502,34 @@ save_pi_auth_from_codex_profile() {
   target="$(pi_account_path "$profile")"
   [[ -f "$source" ]] || die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
   python3 - "$source" "$target" "$PI_PROVIDER" "$TOKEN_LIFETIME_DAYS" <<'PY'
-import datetime as dt, json, os, sys, tempfile
+import base64, binascii, datetime as dt, json, os, sys, tempfile
 source, target, provider, lifetime_days = sys.argv[1:]
 with open(source, encoding="utf-8") as f:
     codex = json.load(f)
 tokens = codex.get("tokens") or {}
+
+def jwt_expiry_ms(access_token):
+    try:
+        payload = access_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return int(claims["exp"]) * 1000
+    except (
+        AttributeError,
+        binascii.Error,
+        IndexError,
+        KeyError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return None
+
 try:
-    expires = int(tokens.get("expires_at") or ((dt.datetime.now(dt.timezone.utc).timestamp() + int(lifetime_days) * 86400))) * 1000
+    expires = jwt_expiry_ms(tokens.get("access_token"))
+    if expires is None:
+        expires = int(tokens.get("expires_at") or (dt.datetime.now(dt.timezone.utc).timestamp() + int(lifetime_days) * 86400)) * 1000
 except ValueError:
     raise SystemExit("TOKEN_LIFETIME_DAYS must be an integer")
 block = {
@@ -526,6 +556,39 @@ except Exception:
     except FileNotFoundError:
         pass
     raise
+PY
+}
+
+sync_pi_auth_from_codex_profile() {
+  local profile="$1"
+  local update_live=0
+
+  if pi_auth_matches_saved_profile "$profile"; then
+    update_live=1
+  fi
+  save_pi_auth_from_codex_profile "$profile"
+  if [[ "$update_live" -eq 1 ]]; then
+    restore_pi_auth "$profile"
+    note "Updated live Pi auth for active profile '$profile'."
+  else
+    note "Updated Pi auth snapshot for inactive profile '$profile'."
+  fi
+}
+
+pi_auth_matches_saved_profile() {
+  local profile="$1"
+  local saved
+
+  saved="$(pi_account_path "$profile")"
+  [[ -f "$PI_AUTH_FILE" && -f "$saved" ]] || return 1
+  python3 - "$PI_AUTH_FILE" "$saved" "$PI_PROVIDER" <<'PY'
+import json, sys
+live_path, saved_path, provider = sys.argv[1:]
+with open(live_path, encoding="utf-8") as f:
+    live = json.load(f)
+with open(saved_path, encoding="utf-8") as f:
+    saved = json.load(f)
+raise SystemExit(0 if live.get(provider) == saved.get(provider) else 1)
 PY
 }
 
@@ -1701,11 +1764,17 @@ command_pi() {
       save_pi_auth_from_codex_profile "$profile"
       note "Converted Codex auth snapshot to Pi auth for '$profile'."
       ;;
+    sync)
+      local profile="${1:-}"
+      validate_profile_name "$profile"
+      ensure_dirs
+      sync_pi_auth_from_codex_profile "$profile"
+      ;;
     help|-h|--help)
       usage
       ;;
     *)
-      die "Unknown pi command '$subcommand'. Use: save, use, run, login, convert."
+      die "Unknown pi command '$subcommand'. Use: save, use, run, login, convert, sync."
       ;;
   esac
 }

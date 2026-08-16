@@ -210,6 +210,7 @@ codex-profile pi use <profile>
 codex-profile pi run [profile] [-- <pi args...>]
 codex-profile pi login <profile>
 codex-profile pi convert <profile>
+codex-profile pi sync <profile>
 codex-profile run [profile] [-- <codex args...>]
 codex-profile <profile> [-- <codex args...>]
 ```
@@ -232,6 +233,12 @@ Useful commands:
 - `codex-profile pi run <profile>` restores both, then runs `pi`.
 - `codex-profile pi login <profile>` prints the manual-login reminder.
 - `codex-profile pi convert <profile>` creates a Pi snapshot from a saved Codex snapshot.
+- `codex-profile pi sync <profile>` recreates that snapshot using the JWT's real expiry and also updates live Pi auth when the profile is active.
+
+`pi convert` and `pi sync` intentionally make Codex and Pi share one rotating OAuth
+credential. Use `pi sync` from a proactive refresh coordinator before token expiry;
+if Pi has independently changed its live credential, `pi sync` preserves that live
+credential and updates only the saved snapshot.
 
 ## Notes
 
