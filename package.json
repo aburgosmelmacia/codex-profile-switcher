@@ -1,0 +1,6 @@
+{
+  "name": "codex-profile-consumer-tests",
+  "private": true,
+  "scripts": { "test": "python3 -m unittest discover -s tests -v" },
+  "devDependencies": { "proper-lockfile": "4.1.2" }
+}

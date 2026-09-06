@@ -22,6 +22,12 @@ PI_AUTH_FILE="${PI_AUTH_FILE:-$HOME/.pi/agent/auth.json}"
 PI_PROVIDER="openai-codex"
 TOKEN_LIFETIME_DAYS="${TOKEN_LIFETIME_DAYS:-10}"
 
+# Consumer installations receive access-only snapshots from a central writer.
+# Keep all their commands out of the owner paths that save or refresh tokens.
+if [[ "${CODEX_PROFILE_CONSUMER:-0}" == "1" || "${CODEX_PROFILE_CONSUMER:-0}" == "true" || -f "${CODEX_PROFILE_CONSUMER_FILE:-$PROFILE_STORE/.consumer}" ]]; then
+  exec python3 "$(dirname "$(readlink -f "$0")")/codex-consumer-auth.py" profile "$@"
+fi
+
 AUTO_SWITCH_ENABLED_DEFAULT="false"
 AUTO_SWITCH_WEEKLY_THRESHOLD_DEFAULT="20"
 AUTO_SWITCH_FIVE_HOUR_THRESHOLD_DEFAULT="20"
