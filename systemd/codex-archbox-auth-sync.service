@@ -1,0 +1,11 @@
+[Unit]
+Description=Send access-only Codex and Pi profiles to Archbox
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/codex-auth/bin/codex-consumer-auth.py publish --source-dir %h/.codex-auth-shared/accounts --host archbox --receiver /home/alberto/.local/share/codex-auth/bin/codex-consumer-auth.py
+TimeoutStartSec=40
+UMask=0077
+NoNewPrivileges=true
+Environment=PYTHONDONTWRITEBYTECODE=1

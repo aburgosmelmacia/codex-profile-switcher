@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch central profiles for Archbox synchronization
+
+[Path]
+PathChanged=%h/.codex-auth-shared/accounts/shared.auth.json
+PathChanged=%h/.codex-auth-shared/accounts/secondary.auth.json
+Unit=codex-archbox-auth-sync.service
+
+[Install]
+WantedBy=default.target

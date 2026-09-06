@@ -3,6 +3,75 @@
 Small shell tool to switch between Codex accounts while keeping one shared Codex
 workspace.
 
+## Access-only consumer machines (Codex and Pi)
+
+A consumer receives `shared` and `secondary` from a central owner over SSH.
+Only the owner retains renewal credentials. The publisher strips renewal tokens
+and API keys before opening the SSH stream; it never puts credentials in process
+arguments, diagnostics, or a local transfer spool.
+
+Install all three files from `bin/` together on the consumer. Create a private
+`~/.codex/.codex-profile/consumer.json` with these machine-specific settings:
+
+```json
+{
+  "account_ids": {"shared": "EXPECTED_SHARED_ID", "secondary": "EXPECTED_SECONDARY_ID"},
+  "codex_bin": "/absolute/path/to/the/real/codex",
+  "pi_bin": "/absolute/path/to/the/real/pi",
+  "pi_package": "/absolute/path/to/pi-coding-agent",
+  "pi_auth": "/home/USER/.pi/agent/auth.json"
+}
+```
+
+The real binaries must not point back to the launchers. Pi's package must include
+`proper-lockfile`; the receiver uses that same lock protocol when merging the
+`openai-codex` entry. Other providers are preserved. The configuration and auth
+files must be private to the consumer user.
+
+From the owner, after establishing the SSH host key and backing up the consumer's
+existing settings and auth files, perform the initial delivery:
+
+```bash
+bin/codex-consumer-auth.py publish --source-dir /path/to/owner/accounts \
+  --host CONSUMER_SSH_ALIAS --receiver /absolute/path/to/codex-consumer-auth.py
+```
+
+Successful delivery creates the `.consumer` marker. Thereafter `codex-profile`
+routes to the access-only implementation and cannot import legacy owner tokens,
+save live credentials to snapshots, or automatically switch accounts by quota.
+Use launchers invoking `codex-profile run -- "$@"` and
+`codex-profile pi run -- "$@"` for Codex and Pi respectively; put their directory
+before older installations in the interactive shell's PATH.
+
+`codex-profile use shared|secondary` selects both applications; `current`, `list`,
+and `status` show credential-free metadata. New launches use that selection.
+Already-running agents should be restarted when switching accounts. Synchronizing
+the owner does not change the consumer's selection, initially `secondary`.
+
+The deployment-specific user units under `systemd/` push to Archbox on central file
+changes and every five minutes. Their source, `~/.codex-auth-shared/accounts`, is
+the existing central-distribution store on this VPS, also used for its other
+consumers; it is not a new directory created by this feature. Its profile files
+are hard links to the owner's managed snapshots. For another installation, adapt
+both `--source-dir` and the `PathChanged` entries to its actual owner profile store
+(normally `~/.codex/.codex-profile/accounts`), as well as its SSH host and receiver
+path. Offline delivery fails without changing the consumer's files; the timer
+retries. A disconnected consumer can continue only while its access token is valid.
+Both profiles must be valid to accept a batch; expired, wrong-account, and older
+snapshots are rejected. No OAuth renewal is performed by this helper.
+
+Monitor with `systemctl --user status codex-archbox-auth-sync.service` and
+`journalctl --user -u codex-archbox-auth-sync.service`. To roll back, disable its
+path and timer, restore the saved launchers/settings and private auth backup, and
+reinstall the recorded earlier CLI package versions if required.
+
+Tests use synthetic credentials and a local Pi-compatible lock fixture:
+
+```bash
+npm ci --ignore-scripts
+npm test
+```
+
 `codex-profile` keeps:
 
 - one shared `CODEX_HOME`, usually `~/.codex`
