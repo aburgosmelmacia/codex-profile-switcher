@@ -1,0 +1,2399 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+shopt -s nullglob extglob
+
+PROGRAM="${0##*/}"
+CODEX_BIN="${CODEX_BIN:-codex}"
+PI_BIN="${PI_BIN:-pi}"
+SHARED_CODEX_HOME="${CODEX_SHARED_HOME:-${CODEX_HOME:-$HOME/.codex}}"
+AUTH_FILE="${AUTH_FILE:-$SHARED_CODEX_HOME/auth.json}"
+PROFILE_STORE="${CODEX_PROFILE_STORE:-$SHARED_CODEX_HOME/.codex-profile}"
+ACCOUNTS_HOME="${CODEX_AUTH_PROFILES_HOME:-$PROFILE_STORE/accounts}"
+LIMITS_HOME="${CODEX_PROFILE_LIMITS_HOME:-$PROFILE_STORE/limits}"
+DEFAULT_FILE="${CODEX_PROFILE_DEFAULT_FILE:-$PROFILE_STORE/.default-profile}"
+CURRENT_FILE="${CODEX_CURRENT_PROFILE_FILE:-$PROFILE_STORE/.current-profile}"
+CONFIG_FILE="${CODEX_PROFILE_CONFIG_FILE:-$PROFILE_STORE/config.toml}"
+PROBE_ROOT="${CODEX_PROFILE_PROBE_ROOT:-$PROFILE_STORE/probes}"
+LEGACY_PROFILE_ROOT="${CODEX_LEGACY_PROFILE_ROOT:-$HOME/.codex-profiles}"
+LIVE_PROBE_TIMEOUT_SECONDS="${CODEX_PROFILE_LIVE_PROBE_TIMEOUT_SECONDS:-25}"
+DEBUG_MODE="${CODEX_PROFILE_DEBUG:-0}"
+PI_AUTH_FILE="${PI_AUTH_FILE:-$HOME/.pi/agent/auth.json}"
+PI_PROVIDER="openai-codex"
+TOKEN_LIFETIME_DAYS="${TOKEN_LIFETIME_DAYS:-10}"
+CONSUMER_MODE="${CODEX_PROFILE_CONSUMER:-0}"
+CONSUMER_MARKER="${CODEX_PROFILE_CONSUMER_FILE:-$PROFILE_STORE/.consumer}"
+
+AUTO_SWITCH_ENABLED_DEFAULT="false"
+AUTO_SWITCH_WEEKLY_THRESHOLD_DEFAULT="20"
+AUTO_SWITCH_FIVE_HOUR_THRESHOLD_DEFAULT="20"
+AUTO_SWITCH_POLICY_DEFAULT="or"
+AUTO_SWITCH_FALLBACK_DEFAULT="default_profile"
+
+declare -A PROBE_WEEKLY=()
+declare -A PROBE_FIVE=()
+declare -A PROBE_DONE=()
+declare -A PROBE_OBSERVED=()
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+note() {
+  printf '%s\n' "$*"
+}
+
+stderr_note() {
+  printf '%s\n' "$*" >&2
+}
+
+debug_note() {
+  [[ "$DEBUG_MODE" == "1" ]] || return 0
+  printf '[debug] %s\n' "$*" >&2
+}
+
+is_consumer_mode() {
+  [[ "$CONSUMER_MODE" == "1" || "$CONSUMER_MODE" == "true" || -f "$CONSUMER_MARKER" ]]
+}
+
+deny_consumer_credential_write() {
+  local operation="$1"
+
+  if is_consumer_mode; then
+    die "'$operation' is disabled in consumer mode. Credentials are managed by the central writer."
+  fi
+}
+
+resolve_existing_path() {
+  local target="${1:-}"
+  local resolved=""
+
+  [[ -n "$target" ]] || die "Path is required."
+  resolved="$(readlink -f "$target" 2>/dev/null || true)"
+  [[ -n "$resolved" ]] || die "Unable to resolve path '$target'."
+  printf '%s\n' "$resolved"
+}
+
+absolute_target_path() {
+  local target="${1:-}"
+  local dir base
+
+  [[ -n "$target" ]] || die "Path is required."
+
+  if [[ "$target" == /* ]]; then
+    printf '%s\n' "$target"
+    return 0
+  fi
+
+  dir="$(dirname "$target")"
+  base="$(basename "$target")"
+  dir="$(cd "$dir" 2>/dev/null && pwd -P)" || die "Unable to resolve parent directory for '$target'."
+  printf '%s/%s\n' "$dir" "$base"
+}
+
+install_wrapper_usage() {
+  cat <<EOF
+Usage:
+  $PROGRAM install-wrapper [--force] [--wrapper-path PATH] [--real-path PATH] [--codex-bin PATH]
+
+Options:
+  --force
+      Overwrite existing wrapper or codex-real link if they differ.
+
+  --wrapper-path PATH
+      Where to install the generated wrapper. Default: $HOME/.local/bin/codex
+
+  --real-path PATH
+      Where to expose the real Codex binary. Default: $HOME/.local/bin/codex-real
+
+  --codex-bin PATH
+      Explicit path to the real Codex binary. Use this if autodetection fails.
+EOF
+}
+
+usage() {
+  cat <<EOF
+$PROGRAM - shared-session profile manager for Codex accounts
+
+Usage:
+  $PROGRAM help
+  $PROGRAM install-wrapper [--force] [--wrapper-path PATH] [--real-path PATH] [--codex-bin PATH]
+  $PROGRAM list
+  $PROGRAM limits
+  $PROGRAM limits refresh [profile]
+  $PROGRAM setup
+  $PROGRAM current
+  $PROGRAM use <profile>
+  $PROGRAM path <profile>
+  $PROGRAM save <profile>
+  $PROGRAM login <profile>
+  $PROGRAM status [profile]
+  $PROGRAM config show
+  $PROGRAM config set <key> <value>
+  $PROGRAM config tui
+  $PROGRAM pi save <profile>
+  $PROGRAM pi use <profile>
+  $PROGRAM pi run [profile] [-- <pi args...>]
+  $PROGRAM pi login <profile>
+  $PROGRAM pi convert <profile>
+  $PROGRAM pi sync <profile>
+  $PROGRAM run [profile] [-- <codex args...>]
+  $PROGRAM <profile> [-- <codex args...>]
+
+Commands:
+  install-wrapper
+      Install a safe 'codex' wrapper that routes through '$PROGRAM run' while
+      preserving the real Codex binary as 'codex-real'. This avoids recursive
+      symlink loops by forcing internal Codex calls to use the preserved binary.
+
+  list
+      List saved auth profiles from $ACCOUNTS_HOME.
+
+  limits
+      Show the last known weekly and 5-hour limits cached for each saved profile.
+      Use 'limits refresh [profile]' to force a live refresh first.
+
+  setup
+      Open the interactive setup TUI. Alias for '$PROGRAM config tui'.
+
+  current
+      Show the default profile.
+
+  use <profile>
+      Set the default profile.
+
+  path <profile>
+      Print the saved auth snapshot path for a profile.
+
+  save <profile>
+      Save the current live auth.json as the named profile without logging in again.
+
+  login <profile>
+      Run 'codex login --device-auth' in the shared CODEX_HOME and save the
+      resulting auth.json as the named profile.
+
+  status [profile]
+      Show live login status. If a profile is provided, also report whether its
+      saved auth snapshot exists and whether it is active.
+
+  config show
+      Show effective auto-switch configuration.
+
+  config set <key> <value>
+      Update one config value in $CONFIG_FILE.
+      Supported keys:
+        auto_switch.enabled
+        auto_switch.weekly_threshold_percent
+        auto_switch.five_hour_threshold_percent
+        auto_switch.policy
+        auto_switch.fallback
+
+  config tui
+      Open a small whiptail-based TUI to edit auto-switch config and the default
+      profile.
+
+  pi save <profile>
+      Save the current Pi openai-codex auth block as the named profile.
+
+  pi use <profile>
+      Restore the selected Codex profile and Pi openai-codex auth block.
+
+  pi run [profile] [-- <pi args...>]
+      Restore the selected profile for Codex and Pi, then run Pi.
+
+  pi login <profile>
+      Explain the manual Pi OAuth flow, then point to 'pi save'.
+
+  pi convert <profile>
+      Rebuild the saved Pi auth snapshot from the saved Codex profile.
+
+  pi sync <profile>
+      Rebuild the Pi snapshot from Codex and update live Pi auth when the
+      profile is currently active.
+
+  run [profile] [-- <codex args...>]
+      Restore the selected profile's auth.json into the shared CODEX_HOME and
+      run Codex there. Sessions, skills, history, and config remain shared.
+      If no profile is passed and auto-switch is enabled, the tool evaluates the
+      current profile's limits and may jump to a better saved profile.
+
+  <profile> [-- <codex args...>]
+      Shorthand for '$PROGRAM run <profile> [-- <codex args...>]'.
+
+Examples:
+  $PROGRAM install-wrapper
+  $PROGRAM install-wrapper --force
+  $PROGRAM save melmacia1
+  $PROGRAM login melmacia2
+  $PROGRAM setup
+  $PROGRAM limits
+  $PROGRAM limits refresh
+  $PROGRAM limits refresh melmacia2
+  $PROGRAM config tui
+  $PROGRAM config set auto_switch.enabled true
+  $PROGRAM config set auto_switch.weekly_threshold_percent 20
+  $PROGRAM pi save melmacia1
+  $PROGRAM pi run melmacia1
+  $PROGRAM run
+  $PROGRAM melmacia2 -- resume --last
+EOF
+}
+
+trim() {
+  local s="${1:-}"
+  s="${s##+([[:space:]])}"
+  s="${s%%+([[:space:]])}"
+  printf '%s' "$s"
+}
+
+ensure_dirs() {
+  mkdir -p "$SHARED_CODEX_HOME" "$PROFILE_STORE" "$ACCOUNTS_HOME" "$LIMITS_HOME" "$PROBE_ROOT"
+  # The live auth file lives in $SHARED_CODEX_HOME.  If that directory cannot be
+  # guaranteed private (exactly 0700) the token could be exposed to others, so
+  # this fails closed instead of carrying on as if the mode had been applied.
+  chmod 700 "$SHARED_CODEX_HOME" 2>/dev/null || true
+  if [[ "$(stat -c %a "$SHARED_CODEX_HOME" 2>/dev/null || printf '?')" != "700" ]]; then
+    die "Cannot secure '$SHARED_CODEX_HOME' with mode 700: it holds the live Codex auth and must stay private. Fix its ownership and permissions (chmod 700, chown $(id -u)) and retry."
+  fi
+  chmod 700 "$PROFILE_STORE" 2>/dev/null || true
+  chmod 700 "$ACCOUNTS_HOME" 2>/dev/null || true
+  chmod 700 "$LIMITS_HOME" 2>/dev/null || true
+  chmod 700 "$PROBE_ROOT" 2>/dev/null || true
+}
+
+# AUTH_FILE may point anywhere, but Codex is always launched with
+# CODEX_HOME="$SHARED_CODEX_HOME" and therefore reads
+# "$SHARED_CODEX_HOME/auth.json".  If AUTH_FILE resolves to a different file,
+# the profile switch and the daemon freshness rule watch a file Codex does not
+# use, so the account guarantee is void: refuse instead of opening a session.
+# The comparison is file identity (realpath), not spelling.
+require_coupled_auth_file() {
+  local resolved got want
+
+  if resolved="$(python3 - "$AUTH_FILE" "$SHARED_CODEX_HOME/auth.json" <<'PY'
+import os
+import sys
+
+got = os.path.realpath(sys.argv[1])
+want = os.path.realpath(sys.argv[2])
+if got != want:
+    print(got)
+    print(want)
+    raise SystemExit(1)
+PY
+  )"; then
+    return 0
+  fi
+
+  got="$(printf '%s\n' "$resolved" | sed -n 1p)"
+  want="$(printf '%s\n' "$resolved" | sed -n 2p)"
+  stderr_note "AUTH_FILE resolves to '$got' but Codex reads '$want': the profile switch and the daemon check would watch a different file than Codex uses."
+  stderr_note "Point AUTH_FILE at '$want' (or unset it) and retry; CODEX_PROFILE_ALLOW_STALE_DAEMON=1 continues with no account guarantee."
+  if [[ "${CODEX_PROFILE_ALLOW_STALE_DAEMON:-0}" == "1" ]]; then
+    stderr_note "CODEX_PROFILE_ALLOW_STALE_DAEMON=1: continuing with a decoupled AUTH_FILE under your responsibility."
+    return 0
+  fi
+  return 1
+}
+
+validate_profile_name() {
+  local profile="${1:-}"
+
+  [[ -n "$profile" ]] || die "Profile name is required."
+
+  if [[ ! "$profile" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    die "Invalid profile '$profile'. Use letters, numbers, dots, dashes, or underscores."
+  fi
+}
+
+validate_percent() {
+  local value="${1:-}"
+
+  [[ "$value" =~ ^[0-9]+$ ]] || die "Expected an integer percent, got '$value'."
+  (( value >= 0 && value <= 100 )) || die "Percent must be between 0 and 100, got '$value'."
+}
+
+validate_policy() {
+  local value="${1:-}"
+
+  case "$value" in
+    or|and|weekly_only)
+      ;;
+    *)
+      die "Unsupported auto_switch.policy '$value'. Use: or, and, weekly_only."
+      ;;
+  esac
+}
+
+validate_fallback() {
+  local value="${1:-}"
+
+  case "$value" in
+    default_profile)
+      ;;
+    *)
+      die "Unsupported auto_switch.fallback '$value'. Use: default_profile."
+      ;;
+  esac
+}
+
+account_path() {
+  local profile="$1"
+  printf '%s/%s.auth.json\n' "$ACCOUNTS_HOME" "$profile"
+}
+
+pi_account_path() {
+  local profile="$1"
+  printf '%s/%s.pi-auth.json\n' "$ACCOUNTS_HOME" "$profile"
+}
+
+legacy_auth_path() {
+  local profile="$1"
+  printf '%s/%s/auth.json\n' "$LEGACY_PROFILE_ROOT" "$profile"
+}
+
+limits_cache_path() {
+  local profile="$1"
+  printf '%s/%s.toml\n' "$LIMITS_HOME" "$profile"
+}
+
+set_default_profile() {
+  local profile="$1"
+
+  printf '%s\n' "$profile" >"$DEFAULT_FILE" || return 1
+  chmod 600 "$DEFAULT_FILE" 2>/dev/null || true
+}
+
+get_default_profile() {
+  [[ -f "$DEFAULT_FILE" ]] || return 1
+
+  local profile=""
+  IFS= read -r profile <"$DEFAULT_FILE" || true
+  [[ -n "$profile" ]] || return 1
+  validate_profile_name "$profile"
+  printf '%s\n' "$profile"
+}
+
+set_current_profile() {
+  local profile="$1"
+
+  printf '%s\n' "$profile" >"$CURRENT_FILE" || return 1
+  chmod 600 "$CURRENT_FILE" 2>/dev/null || true
+}
+
+get_recorded_current_profile() {
+  [[ -f "$CURRENT_FILE" ]] || return 1
+
+  local profile=""
+  IFS= read -r profile <"$CURRENT_FILE" || true
+  [[ -n "$profile" ]] || return 1
+  validate_profile_name "$profile"
+  printf '%s\n' "$profile"
+}
+
+copy_file_secure() {
+  local source="$1"
+  local destination="$2"
+  local target tmp_file target_dir
+
+  target="$destination"
+  if [[ -L "$destination" ]]; then
+    target="$(readlink -f "$destination")" || die "Unable to resolve symlink '$destination'."
+  fi
+
+  if [[ -e "$target" ]]; then
+    cp "$source" "$target" || return 1
+    return 0
+  fi
+
+  target_dir="$(dirname "$target")"
+  tmp_file="$(mktemp "$target_dir/.${target##*/}.tmp.XXXXXX")" || return 1
+  cp "$source" "$tmp_file" || return 1
+  chmod 600 "$tmp_file" 2>/dev/null || true
+  mv "$tmp_file" "$target" || return 1
+}
+
+import_legacy_profile_if_needed() {
+  local profile="$1"
+  local target legacy
+
+  target="$(account_path "$profile")"
+  [[ -f "$target" ]] && return 0
+  is_consumer_mode && return 0
+
+  legacy="$(legacy_auth_path "$profile")"
+  [[ -f "$legacy" ]] || return 0
+
+  copy_file_secure "$legacy" "$target"
+  note "Imported legacy auth for '$profile' from $legacy."
+}
+
+saved_profiles() {
+  ensure_dirs
+
+  local file profile
+  for file in "$ACCOUNTS_HOME"/*.auth.json; do
+    [[ -f "$file" ]] || continue
+    profile="${file##*/}"
+    profile="${profile%.auth.json}"
+    printf '%s\n' "$profile"
+  done
+}
+
+require_live_auth() {
+  [[ -f "$AUTH_FILE" ]] || die "No live auth file found at $AUTH_FILE. Run '$PROGRAM login <profile>' first."
+}
+
+require_pi_auth() {
+  [[ -f "$PI_AUTH_FILE" ]] || die "No Pi auth file found at $PI_AUTH_FILE. Run Pi login first, then '$PROGRAM pi save <profile>'."
+}
+
+save_live_auth_as_profile() {
+  local profile="$1"
+
+  require_live_auth
+  copy_file_secure "$AUTH_FILE" "$(account_path "$profile")"
+}
+
+restore_profile_auth() {
+  local profile="$1"
+  local source
+
+  import_legacy_profile_if_needed "$profile"
+  source="$(account_path "$profile")"
+  [[ -f "$source" ]] || die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
+  if is_consumer_mode; then
+    [[ ! -L "$AUTH_FILE" ]] || die "Consumer auth target '$AUTH_FILE' must not be a symlink."
+    python3 - "$source" "$AUTH_FILE" <<'PY'
+import json, os, sys, tempfile
+
+source, target = sys.argv[1:]
+with open(source, encoding="utf-8") as f:
+    auth = json.load(f)
+
+tokens = auth.get("tokens")
+if not isinstance(tokens, dict):
+    raise SystemExit(f"Missing tokens object in {source}")
+for field in ("access_token", "account_id"):
+    if not isinstance(tokens.get(field), str) or not tokens[field]:
+        raise SystemExit(f"Missing {field} in {source}")
+
+# Codex 0.147 accepts an empty refresh_token while the access token is valid.
+# Keeping the field preserves the expected schema without sharing a rotating
+# credential with consumer users.
+tokens["refresh_token"] = ""
+
+target_dir = os.path.dirname(target)
+os.makedirs(target_dir, mode=0o700, exist_ok=True)
+payload = json.dumps(auth, indent=2, sort_keys=True) + "\n"
+# Republishing identical bytes would only bump the auth mtime, and the daemon
+# freshness rule compares against that mtime: every TUI open in consumer mode
+# would then look like a profile switch and restart the daemon, interrupting
+# open sessions.  Identical content means nothing changed.
+try:
+    with open(target, encoding="utf-8") as f:
+        current = f.read()
+except FileNotFoundError:
+    current = None
+except OSError as exc:
+    raise SystemExit("Cannot read %s to compare it (%s); fix its owner and mode and retry"
+                     % (target, exc.strerror or exc))
+if current == payload:
+    # Nothing to publish; the content (and its mtime) must stay untouched so a
+    # fresh daemon is not mistaken for stale.  The metadata that keeps the token
+    # private (exact mode and owner) is still enforced, and it fails closed: an
+    # auth.json left readable by others must not survive an opening.
+    status = os.stat(target)
+    if (status.st_mode & 0o7777) != 0o600:
+        try:
+            os.chmod(target, 0o600)
+        except OSError as exc:
+            raise SystemExit("Cannot secure %s: chmod 0600 failed (%s)"
+                             % (target, exc.strerror or exc))
+        status = os.stat(target)
+        if (status.st_mode & 0o7777) != 0o600:
+            raise SystemExit("Cannot secure %s: mode %s is not 0600"
+                             % (target, oct(status.st_mode & 0o7777)))
+    if status.st_uid != os.getuid():
+        try:
+            os.chown(target, os.getuid(), -1)
+        except OSError as exc:
+            raise SystemExit("Cannot secure %s: it is owned by uid %d and could not be taken over (%s)"
+                             % (target, status.st_uid, exc.strerror or exc))
+        status = os.stat(target)
+        if status.st_uid != os.getuid():
+            raise SystemExit("Cannot secure %s: it is still owned by uid %d"
+                             % (target, status.st_uid))
+    raise SystemExit(0)
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(target) + ".tmp.", dir=target_dir)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(payload)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+  else
+    copy_file_secure "$source" "$AUTH_FILE"
+  fi
+}
+
+save_pi_auth_as_profile() {
+  local profile="$1"
+  local target
+
+  require_pi_auth
+  target="$(pi_account_path "$profile")"
+  python3 - "$PI_AUTH_FILE" "$target" "$PI_PROVIDER" <<'PY'
+import json, os, sys, tempfile
+source, target, provider = sys.argv[1:]
+with open(source, encoding="utf-8") as f:
+    data = json.load(f)
+block = data.get(provider)
+if not isinstance(block, dict):
+    raise SystemExit(f"Missing {provider} auth block in {source}")
+os.makedirs(os.path.dirname(target), exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(target) + ".tmp.", dir=os.path.dirname(target))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({provider: block}, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
+
+validate_pi_auth_snapshot() {
+  local profile="$1"
+  local source
+
+  source="$(pi_account_path "$profile")"
+  [[ -f "$source" ]] || die "Unknown Pi auth profile '$profile'. Run '$PROGRAM pi save $profile' first."
+  python3 - "$source" "$PI_PROVIDER" <<'PY'
+import json, sys
+source_path, provider = sys.argv[1:]
+with open(source_path, encoding="utf-8") as f:
+    saved = json.load(f)
+if not isinstance(saved.get(provider), dict):
+    raise SystemExit(f"Missing {provider} auth block in {source_path}")
+PY
+}
+
+restore_pi_auth() {
+  local profile="$1"
+  local source
+
+  source="$(pi_account_path "$profile")"
+  validate_pi_auth_snapshot "$profile"
+  mkdir -p "$(dirname "$PI_AUTH_FILE")"
+  python3 - "$PI_AUTH_FILE" "$source" "$PI_PROVIDER" <<'PY'
+import json, os, sys, tempfile
+live_path, source_path, provider = sys.argv[1:]
+if os.path.exists(live_path):
+    with open(live_path, encoding="utf-8") as f:
+        live = json.load(f)
+else:
+    live = {}
+with open(source_path, encoding="utf-8") as f:
+    saved = json.load(f)
+block = saved.get(provider)
+if not isinstance(block, dict):
+    raise SystemExit(f"Missing {provider} auth block in {source_path}")
+live[provider] = block
+os.makedirs(os.path.dirname(live_path), exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(live_path) + ".tmp.", dir=os.path.dirname(live_path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(live, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, live_path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
+
+save_pi_auth_from_codex_profile() {
+  local profile="$1"
+  local source target
+
+  source="$(account_path "$profile")"
+  target="$(pi_account_path "$profile")"
+  [[ -f "$source" ]] || die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
+  python3 - "$source" "$target" "$PI_PROVIDER" "$TOKEN_LIFETIME_DAYS" <<'PY'
+import base64, binascii, datetime as dt, json, os, sys, tempfile
+source, target, provider, lifetime_days = sys.argv[1:]
+with open(source, encoding="utf-8") as f:
+    codex = json.load(f)
+tokens = codex.get("tokens") or {}
+
+def jwt_expiry_ms(access_token):
+    try:
+        payload = access_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return int(claims["exp"]) * 1000
+    except (
+        AttributeError,
+        binascii.Error,
+        IndexError,
+        KeyError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return None
+
+try:
+    expires = jwt_expiry_ms(tokens.get("access_token"))
+    if expires is None:
+        expires = int(tokens.get("expires_at") or (dt.datetime.now(dt.timezone.utc).timestamp() + int(lifetime_days) * 86400)) * 1000
+except ValueError:
+    raise SystemExit("TOKEN_LIFETIME_DAYS must be an integer")
+block = {
+    "type": "oauth",
+    "access": tokens.get("access_token"),
+    "refresh": tokens.get("refresh_token"),
+    "expires": expires,
+    "accountId": tokens.get("account_id"),
+}
+missing = [k for k, v in block.items() if k != "type" and not v]
+if missing:
+    raise SystemExit("Missing Codex token fields: " + ", ".join(missing))
+os.makedirs(os.path.dirname(target), exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(target) + ".tmp.", dir=os.path.dirname(target))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({provider: block}, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
+
+sync_pi_auth_from_codex_profile() {
+  local profile="$1"
+  local update_live=0
+
+  if pi_auth_matches_saved_profile "$profile"; then
+    update_live=1
+  fi
+  save_pi_auth_from_codex_profile "$profile"
+  if [[ "$update_live" -eq 1 ]]; then
+    restore_pi_auth "$profile"
+    note "Updated live Pi auth for active profile '$profile'."
+  else
+    note "Updated Pi auth snapshot for inactive profile '$profile'."
+  fi
+}
+
+pi_auth_matches_saved_profile() {
+  local profile="$1"
+  local saved
+
+  saved="$(pi_account_path "$profile")"
+  [[ -f "$PI_AUTH_FILE" && -f "$saved" ]] || return 1
+  python3 - "$PI_AUTH_FILE" "$saved" "$PI_PROVIDER" <<'PY'
+import json, sys
+live_path, saved_path, provider = sys.argv[1:]
+with open(live_path, encoding="utf-8") as f:
+    live = json.load(f)
+with open(saved_path, encoding="utf-8") as f:
+    saved = json.load(f)
+raise SystemExit(0 if live.get(provider) == saved.get(provider) else 1)
+PY
+}
+
+switch_pi_profile() {
+  local target="$1"
+
+  validate_pi_auth_snapshot "$target"
+  switch_profile "$target"
+  restore_pi_auth "$target"
+}
+
+match_live_profile() {
+  [[ -f "$AUTH_FILE" ]] || return 1
+
+  local file profile
+  for file in "$ACCOUNTS_HOME"/*.auth.json; do
+    [[ -f "$file" ]] || continue
+    if cmp -s "$AUTH_FILE" "$file"; then
+      profile="${file##*/}"
+      profile="${profile%.auth.json}"
+      printf '%s\n' "$profile"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+resolve_profile() {
+  local requested="${1:-}"
+
+  if [[ -n "$requested" ]]; then
+    validate_profile_name "$requested"
+    printf '%s\n' "$requested"
+    return 0
+  fi
+
+  get_default_profile || die "No default profile set. Run '$PROGRAM use <profile>' or pass a profile explicitly."
+}
+
+refresh_recorded_profile_snapshot() {
+  local live_profile="${1:-}"
+
+  [[ -n "$live_profile" ]] || return 0
+  [[ -f "$AUTH_FILE" ]] || return 0
+  save_live_auth_as_profile "$live_profile"
+}
+
+# The Codex TUI reuses a long-lived background "app-server" daemon that keeps
+# serving the credentials it was born with; switching profiles on disk does not
+# make it re-read them.  After a successful profile switch the daemon is
+# therefore invalidated so the next TUI starts one with the current account
+# (observed 29-sep: /status showed shared's window while the live auth was
+# secondary).
+#
+# Freshness (was the daemon born before the last write of the live auth?) is a
+# heuristic, not account identity: processStartTime has one-second resolution,
+# is local time, and a timezone/DST change or a clock going backwards can skew
+# the comparison.  When it is inconclusive the daemon is invalidated: serving
+# the right account wins over an unnecessary restart of a background process.
+#
+# Return codes: 0 = nothing to invalidate, daemon fresh, or invalidated and
+# confirmed; 1 = the daemon could not be inspected or its identity could not be
+# verified (no signal was sent); 2 = it is known to be obsolete and either
+# survived SIGTERM and SIGKILL or its stop could not be confirmed -- a caller
+# about to open a session must refuse it.
+#
+# Test seams (the real flow never sets them):
+#   CODEX_PROFILE_APPSERVER_BOOT_ID_FILE        alternate boot-id path
+#   CODEX_PROFILE_APPSERVER_TEST_STAT_ERROR     forces the /proc read failure
+#   CODEX_PROFILE_APPSERVER_TEST_PIDFD_ERROR    forces the pidfd poll failure
+#   CODEX_PROFILE_APPSERVER_TEST_INSPECT_CRASH  inspection dies with no verdict
+invalidate_managed_daemon() {
+  local pid_file="${SHARED_CODEX_HOME}/app-server-daemon/daemon.pid"
+  local verdict rc=0
+
+  [[ -f "$pid_file" ]] || return 0
+
+  verdict="$(python3 - "$pid_file" "$AUTH_FILE" <<'PY'
+import json, os, select, signal, sys, time
+
+pid_file, auth_file = sys.argv[1], sys.argv[2]
+
+
+def finish(token, code, message=""):
+    if message:
+        print(message, file=sys.stderr)
+    print(token)
+    raise SystemExit(code)
+
+
+if os.environ.get("CODEX_PROFILE_APPSERVER_TEST_INSPECT_CRASH") == "1":
+    # Test seam: the inspection dies before printing any verdict so the
+    # caller's "unexpected result" branch is exercisable.
+    raise SystemExit(3)
+
+try:
+    with open(pid_file, encoding="utf-8") as handle:
+        daemon = json.load(handle)
+except Exception:
+    finish("UNREADABLE", 1, "warning: app-server daemon pid file is unreadable; no process was signalled")
+
+pid = daemon.get("pid")
+identity = daemon.get("processIdentity") or {}
+start_ticks = identity.get("startTicks")
+boot_id = identity.get("bootId")
+
+if not isinstance(pid, int) or pid <= 0:
+    finish("UNVERIFIED", 1, "warning: app-server daemon pid file has no usable pid; no process was signalled")
+if not os.path.isdir("/proc/%d" % pid):
+    finish("NONE", 0)
+
+# Who lives at that pid decides what an unverifiable identity means.  A process
+# that looks like the daemon must never be signalled on a guess, and the caller
+# must not open a session on it either (rc 1).  A stranger at a recycled pid is
+# nothing of ours: no signal, no verdict, no warning.
+try:
+    with open("/proc/%d/cmdline" % pid, "rb") as handle:
+        cmdline = handle.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    daemon_like = "app-server" in cmdline
+except Exception:
+    # The cmdline cannot be read either: assume the daemon, so an unreadable
+    # /proc can never relax the check.
+    daemon_like = True
+if not daemon_like:
+    finish("NONE", 0)
+
+
+def unverified(message):
+    # Not signalled.  rc 1 stops a TUI from opening: an identity that cannot be
+    # verified is not a licence to serve a possibly older account.
+    finish("UNVERIFIED", 1, message)
+
+
+if not isinstance(start_ticks, int) or start_ticks <= 0:
+    unverified("warning: app-server daemon pid file has no startTicks; no process was signalled")
+
+# The pidfd pins the process: the pid cannot be recycled while it is held, so
+# every check below describes the process that gets signalled.
+try:
+    pidfd = os.pidfd_open(pid)
+except OSError as exc:
+    unverified("warning: app-server daemon (pid %d) cannot be pinned (%s); no process was signalled" % (pid, exc.strerror or exc))
+
+try:
+    if boot_id:
+        boot_id_path = os.environ.get("CODEX_PROFILE_APPSERVER_BOOT_ID_FILE",
+                                      "/proc/sys/kernel/random/boot_id")
+        try:
+            with open(boot_id_path, encoding="utf-8") as handle:
+                live_boot_id = handle.read().strip()
+        except Exception:
+            live_boot_id = ""
+        if not live_boot_id:
+            unverified("warning: cannot read this boot's id to match the app-server daemon (pid %d); no process was signalled" % pid)
+        if live_boot_id != boot_id:
+            unverified("warning: app-server daemon (pid %d) was recorded on a different boot; no process was signalled" % pid)
+
+    def proc_state():
+        # 'gone', 'Z', any other state letter, or None when it cannot be read.
+        try:
+            with open("/proc/%d/stat" % pid, encoding="utf-8") as handle:
+                text = handle.read()
+        except FileNotFoundError:
+            return "gone"
+        except Exception:
+            return None
+        try:
+            fields = text[text.rindex(")") + 2:].split()
+        except ValueError:
+            return None
+        return fields[0] if fields else None
+
+    state = proc_state()
+    if state == "gone":
+        finish("NONE", 0)
+    if state == "Z":
+        # A zombie serves nothing and its pid cannot be recycled: there is
+        # nothing to signal, and no identity to check (a zombie has no cmdline).
+        finish("NONE", 0)
+    if state is None:
+        unverified("warning: app-server daemon (pid %d) state cannot be read; no process was signalled" % pid)
+
+    try:
+        with open("/proc/%d/stat" % pid, encoding="utf-8") as handle:
+            stat_fields = handle.read()
+        stat_fields = stat_fields[stat_fields.rindex(")") + 2:].split()
+        kernel_ticks = int(stat_fields[19])
+    except Exception:
+        unverified("warning: app-server daemon (pid %d) state cannot be read; no process was signalled" % pid)
+
+    if kernel_ticks != start_ticks:
+        unverified("warning: pid %d is not the recorded app-server daemon (pid recycled?); no process was signalled" % pid)
+
+    # A daemon born strictly after the last write of the live auth was created
+    # with the current account.  An equal timestamp is ambiguous (one-second
+    # resolution), and ambiguity resolves towards invalidating.
+    born = None
+    try:
+        born = time.mktime(time.strptime(" ".join(str(daemon.get("processStartTime")).split()), "%a %b %d %H:%M:%S %Y"))
+    except Exception:
+        born = None
+    auth_mtime = None
+    try:
+        auth_mtime = os.stat(auth_file).st_mtime
+    except Exception:
+        auth_mtime = None
+    if born is not None and auth_mtime is not None and born > auth_mtime:
+        finish("FRESH", 0)
+
+    def finished():
+        # True: confirmed finished (gone, or a zombie that serves nothing).
+        # None: the state could not be read, which must never count as
+        # finished or an unreadable /proc would hide a live daemon.
+        # False: still running.
+        if os.environ.get("CODEX_PROFILE_APPSERVER_TEST_STAT_ERROR") == "1":
+            # Test seam: exercises the unreadable-state branch.
+            return None
+        state = proc_state()
+        if state in ("gone", "Z"):
+            return True
+        if state is None:
+            return None
+        return False
+
+    def pidfd_exited(timeout):
+        # A pidfd is readable once the process exits: confirmation that does not
+        # depend on /proc at all.
+        if os.environ.get("CODEX_PROFILE_APPSERVER_TEST_PIDFD_ERROR") == "1":
+            # Test seam: the branch where neither source can tell.
+            return None
+        try:
+            readable, _, _ = select.select([pidfd], [], [], max(0.0, timeout))
+        except Exception:
+            return None
+        return bool(readable)
+
+    def wait_finished(seconds):
+        # True = confirmed finished; False = confirmed still running;
+        # None = the process state cannot be determined.
+        deadline = time.monotonic() + seconds
+        while True:
+            state = finished()
+            if state is True:
+                return True
+            if state is None:
+                # /proc cannot tell, but the pidfd still can.
+                exited = pidfd_exited(0)
+                if exited is None:
+                    return None
+                if exited:
+                    return True
+            elif pidfd_exited(min(0.2, max(0.0, deadline - time.monotonic()))):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    try:
+        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+    except OSError as exc:
+        finish("ALIVE", 2, "warning: could not stop the app-server daemon (pid %d: %s); open sessions may keep using the previous account" % (pid, exc.strerror or exc))
+
+    state = wait_finished(2.0)
+    if state is not True:
+        # Still running, or its state is unreadable: escalate and confirm again.
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        except OSError:
+            pass
+        state = wait_finished(2.0)
+
+    if state is True:
+        finish("INVALIDATED", 0)
+    if state is None:
+        finish("UNCONFIRMED", 2, "warning: could not confirm that the app-server daemon (pid %d) stopped; open sessions may keep using the previous account" % pid)
+    finish("ALIVE", 2, "warning: app-server daemon (pid %d) survived SIGTERM and SIGKILL; open sessions may keep using the previous account" % pid)
+finally:
+    os.close(pidfd)
+PY
+)" || rc=$?
+
+  # The verdict token decides, not the raw exit status: an unexpected result
+  # must never read as "fresh" or as "invalidated".
+  case "$verdict" in
+    NONE|FRESH|INVALIDATED) debug_note "app-server daemon: $verdict" ;;
+    UNVERIFIED|UNREADABLE) return 1 ;;
+    ALIVE|UNCONFIRMED) return 2 ;;
+    *) stderr_note "warning: could not inspect the app-server daemon (unexpected result, exit $rc); no process was signalled"; return 1 ;;
+  esac
+}
+
+
+# Status of the last daemon invalidation performed by switch_profile: 2 means
+# the app-server daemon is known to still be serving the previous account, so a
+# caller about to open a TUI must refuse unless the operator overrides it with
+# CODEX_PROFILE_ALLOW_STALE_DAEMON=1.
+LAST_DAEMON_INVALIDATION_RC=0
+
+# Refuse to start a client whose server cannot be trusted: rc 1 means the
+# daemon's identity could not be verified (so it cannot be signalled either),
+# rc 2 that it is known to still serve the previous account.  Only the explicit
+# escape opens a session anyway; no environment seam relaxes this silently.
+refuse_stale_daemon() {
+  local opener="$1"
+
+  if [[ "$LAST_DAEMON_INVALIDATION_RC" -eq 1 ]]; then
+    stderr_note "ERROR: the Codex app-server daemon could not be verified for the current account."
+    stderr_note "$opener could use the previous account; no session was started."
+  else
+    stderr_note "ERROR: the Codex app-server daemon is still running with the previous account."
+    stderr_note "$opener would use the wrong account; no session was started."
+  fi
+  stderr_note "Retry, or set CODEX_PROFILE_ALLOW_STALE_DAEMON=1 to open anyway."
+  return 1
+}
+
+switch_profile() {
+  local target="$1"
+  local live_profile=""
+  local recorded_profile=""
+  local invalidation_rc=0
+
+  import_legacy_profile_if_needed "$target"
+
+  live_profile="$(match_live_profile || true)"
+  recorded_profile="$(get_recorded_current_profile || true)"
+
+  if [[ "$live_profile" == "$target" ]] && ! is_consumer_mode; then
+    set_current_profile "$target"
+    invalidate_managed_daemon || invalidation_rc=$?
+    LAST_DAEMON_INVALIDATION_RC="$invalidation_rc"
+    return 0
+  fi
+
+  if ! is_consumer_mode; then
+    if [[ -n "$live_profile" ]]; then
+      refresh_recorded_profile_snapshot "$live_profile"
+    elif [[ -n "$recorded_profile" ]]; then
+      refresh_recorded_profile_snapshot "$recorded_profile"
+    fi
+  fi
+
+  restore_profile_auth "$target"
+  set_current_profile "$target"
+  invalidate_managed_daemon || invalidation_rc=$?
+  LAST_DAEMON_INVALIDATION_RC="$invalidation_rc"
+}
+
+load_config() {
+  AUTO_SWITCH_ENABLED="$AUTO_SWITCH_ENABLED_DEFAULT"
+  AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT="$AUTO_SWITCH_WEEKLY_THRESHOLD_DEFAULT"
+  AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT="$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_DEFAULT"
+  AUTO_SWITCH_POLICY="$AUTO_SWITCH_POLICY_DEFAULT"
+  AUTO_SWITCH_FALLBACK="$AUTO_SWITCH_FALLBACK_DEFAULT"
+
+  [[ -f "$CONFIG_FILE" ]] || return 0
+
+  local line in_auto_switch key value
+  in_auto_switch=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="$(trim "$line")"
+    [[ -n "$line" ]] || continue
+
+    if [[ "$line" == "[auto_switch]" ]]; then
+      in_auto_switch=1
+      continue
+    fi
+
+    if [[ "$line" =~ ^\[.*\]$ ]]; then
+      in_auto_switch=0
+      continue
+    fi
+
+    [[ "$in_auto_switch" -eq 1 ]] || continue
+    [[ "$line" == *"="* ]] || continue
+
+    key="$(trim "${line%%=*}")"
+    value="$(trim "${line#*=}")"
+
+    case "$key" in
+      enabled)
+        value="${value//\"/}"
+        AUTO_SWITCH_ENABLED="$value"
+        ;;
+      weekly_threshold_percent)
+        value="${value//\"/}"
+        AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT="$value"
+        ;;
+      five_hour_threshold_percent)
+        value="${value//\"/}"
+        AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT="$value"
+        ;;
+      policy)
+        value="${value%\"}"
+        value="${value#\"}"
+        AUTO_SWITCH_POLICY="$value"
+        ;;
+      fallback)
+        value="${value%\"}"
+        value="${value#\"}"
+        AUTO_SWITCH_FALLBACK="$value"
+        ;;
+    esac
+  done <"$CONFIG_FILE"
+
+  case "$AUTO_SWITCH_ENABLED" in
+    true|false)
+      ;;
+    *)
+      AUTO_SWITCH_ENABLED="$AUTO_SWITCH_ENABLED_DEFAULT"
+      ;;
+  esac
+
+  if ! [[ "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT" =~ ^[0-9]+$ ]]; then
+    AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT="$AUTO_SWITCH_WEEKLY_THRESHOLD_DEFAULT"
+  fi
+
+  if ! [[ "$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT" =~ ^[0-9]+$ ]]; then
+    AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT="$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_DEFAULT"
+  fi
+
+  validate_percent "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT"
+  validate_percent "$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT"
+  validate_policy "$AUTO_SWITCH_POLICY"
+  validate_fallback "$AUTO_SWITCH_FALLBACK"
+}
+
+write_config() {
+  local tmp_file
+
+  validate_percent "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT"
+  validate_percent "$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT"
+  validate_policy "$AUTO_SWITCH_POLICY"
+  validate_fallback "$AUTO_SWITCH_FALLBACK"
+
+  ensure_dirs
+  tmp_file="$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")"
+
+  {
+    printf '[auto_switch]\n'
+    printf 'enabled = %s\n' "$AUTO_SWITCH_ENABLED"
+    printf 'weekly_threshold_percent = %s\n' "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT"
+    printf 'five_hour_threshold_percent = %s\n' "$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT"
+    printf 'policy = "%s"\n' "$AUTO_SWITCH_POLICY"
+    printf 'fallback = "%s"\n' "$AUTO_SWITCH_FALLBACK"
+  } >"$tmp_file"
+
+  chmod 600 "$tmp_file" 2>/dev/null || true
+  mv "$tmp_file" "$CONFIG_FILE"
+}
+
+strip_control_chars() {
+  tr -d '\r'
+}
+
+write_limits_cache() {
+  local profile="$1"
+  local weekly="$2"
+  local five_hour="$3"
+  local observed_at="$4"
+  local destination tmp_file
+
+  ensure_dirs
+  destination="$(limits_cache_path "$profile")"
+  tmp_file="$(mktemp "${destination}.tmp.XXXXXX")"
+
+  {
+    printf 'observed_at = "%s"\n' "$observed_at"
+    printf 'weekly_remaining_percent = %s\n' "$weekly"
+    printf 'five_hour_remaining_percent = %s\n' "$five_hour"
+  } >"$tmp_file"
+
+  chmod 600 "$tmp_file" 2>/dev/null || true
+  mv "$tmp_file" "$destination"
+}
+
+load_limits_cache_into_memory() {
+  local profile="$1"
+  local cache_file key value line
+  local weekly="" five_hour="" observed_at=""
+
+  [[ -n "${PROBE_DONE[$profile]:-}" ]] && return 0
+  cache_file="$(limits_cache_path "$profile")"
+
+  if [[ -f "$cache_file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%%#*}"
+      line="$(trim "$line")"
+      [[ -n "$line" ]] || continue
+      [[ "$line" == *"="* ]] || continue
+
+      key="$(trim "${line%%=*}")"
+      value="$(trim "${line#*=}")"
+
+      case "$key" in
+        observed_at)
+          value="${value%\"}"
+          value="${value#\"}"
+          observed_at="$value"
+          ;;
+        weekly_remaining_percent)
+          value="${value//\"/}"
+          weekly="$value"
+          ;;
+        five_hour_remaining_percent)
+          value="${value//\"/}"
+          five_hour="$value"
+          ;;
+      esac
+    done <"$cache_file"
+  fi
+
+  if ! [[ "$weekly" =~ ^[0-9]+$ ]]; then
+    weekly=""
+  fi
+  if ! [[ "$five_hour" =~ ^[0-9]+$ ]]; then
+    five_hour=""
+  fi
+
+  PROBE_WEEKLY["$profile"]="$weekly"
+  PROBE_FIVE["$profile"]="$five_hour"
+  PROBE_OBSERVED["$profile"]="$observed_at"
+  PROBE_DONE["$profile"]=1
+
+  debug_note "limits[$profile] weekly=${weekly:-unknown} five_hour=${five_hour:-unknown} observed_at=${observed_at:-unknown}"
+}
+
+latest_rate_limit_record_from_session_file() {
+  local session_file="$1"
+
+  jq -r '
+    select(.type == "event_msg" and .payload.type == "token_count" and (.payload.rate_limits | type == "object")) |
+    .payload.rate_limits as $rl |
+    def remaining($minutes):
+      if (($rl.primary.window_minutes // -1) == $minutes) then (100 - ($rl.primary.used_percent // 0) | floor | tostring)
+      elif (($rl.secondary.window_minutes // -1) == $minutes) then (100 - ($rl.secondary.used_percent // 0) | floor | tostring)
+      else "" end;
+    [.timestamp, remaining(10080), remaining(300)] | @tsv
+  ' "$session_file" 2>/dev/null | tail -n 1
+}
+
+update_limits_cache_from_recent_sessions() {
+  local profile="$1"
+  local started_epoch="$2"
+  local shared_home="${3:-$SHARED_CODEX_HOME}"
+  local record="" timestamp="" weekly="" five_hour=""
+  local best_timestamp="" best_weekly="" best_five=""
+  local -a candidate_files=()
+  local candidate file_listing=""
+
+  [[ -d "$shared_home/sessions" ]] || return 0
+
+  file_listing="$(find "$shared_home/sessions" -type f -name '*.jsonl' -newermt "@$((started_epoch - 1))" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 12 || true)"
+  if [[ -z "$file_listing" ]]; then
+    file_listing="$(find "$shared_home/sessions" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 12 || true)"
+  fi
+
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    candidate_files+=("${candidate#* }")
+  done <<<"$file_listing"
+
+  for candidate in "${candidate_files[@]}"; do
+    record="$(latest_rate_limit_record_from_session_file "$candidate" || true)"
+    [[ -n "$record" ]] || continue
+
+    timestamp="${record%%$'\t'*}"
+    record="${record#*$'\t'}"
+    weekly="${record%%$'\t'*}"
+    five_hour="${record#*$'\t'}"
+
+    [[ -n "$weekly" || -n "$five_hour" ]] || continue
+
+    if [[ -z "$best_timestamp" || "$timestamp" > "$best_timestamp" || "$timestamp" == "$best_timestamp" ]]; then
+      best_timestamp="$timestamp"
+      best_weekly="$weekly"
+      best_five="$five_hour"
+    fi
+  done
+
+  if [[ -n "$best_weekly" || -n "$best_five" ]]; then
+    [[ -n "$best_weekly" ]] || best_weekly="0"
+    [[ -n "$best_five" ]] || best_five="0"
+    write_limits_cache "$profile" "$best_weekly" "$best_five" "$best_timestamp"
+    PROBE_WEEKLY["$profile"]="$best_weekly"
+    PROBE_FIVE["$profile"]="$best_five"
+    PROBE_OBSERVED["$profile"]="$best_timestamp"
+    PROBE_DONE["$profile"]=1
+    stderr_note "Auto-switch: updated cached limits for '$profile' (weekly=${best_weekly}%, five-hour=${best_five}%)."
+  fi
+}
+
+live_probe_profile_limits() {
+  local profile="$1"
+  local source probe_home probe_workspace stdout_file stderr_file started_epoch
+  local timestamp="" weekly="" five_hour=""
+
+  import_legacy_profile_if_needed "$profile"
+  source="$(account_path "$profile")"
+  [[ -f "$source" ]] || return 1
+  ensure_dirs
+
+  probe_home="$(mktemp -d "$PROBE_ROOT/${profile}.home.XXXXXX")"
+  probe_workspace="$(mktemp -d "$PROBE_ROOT/${profile}.work.XXXXXX")"
+  stdout_file="$(mktemp "$PROBE_ROOT/${profile}.stdout.XXXXXX")"
+  stderr_file="$(mktemp "$PROBE_ROOT/${profile}.stderr.XXXXXX")"
+
+  copy_file_secure "$source" "$probe_home/auth.json"
+  if [[ -f "$SHARED_CODEX_HOME/config.toml" ]]; then
+    copy_file_secure "$SHARED_CODEX_HOME/config.toml" "$probe_home/config.toml"
+  fi
+
+  started_epoch="$(date +%s)"
+  timeout "$LIVE_PROBE_TIMEOUT_SECONDS" env CODEX_HOME="$probe_home" "$CODEX_BIN" exec --json \
+    --skip-git-repo-check -C "$probe_workspace" "Respond with exactly OK." >"$stdout_file" 2>"$stderr_file" || true
+
+  debug_note "live-probe[$profile] stdout=$(printf '%q' "$(cat "$stdout_file" 2>/dev/null || true)")"
+  debug_note "live-probe[$profile] stderr=$(printf '%q' "$(cat "$stderr_file" 2>/dev/null || true)")"
+
+  update_limits_cache_from_recent_sessions "$profile" "$started_epoch" "$probe_home" || true
+  timestamp="${PROBE_OBSERVED[$profile]:-}"
+  weekly="${PROBE_WEEKLY[$profile]:-}"
+  five_hour="${PROBE_FIVE[$profile]:-}"
+
+  if [[ -n "$weekly" || -n "$five_hour" ]]; then
+    PROBE_OBSERVED["$profile"]="$timestamp"
+    PROBE_WEEKLY["$profile"]="$weekly"
+    PROBE_FIVE["$profile"]="$five_hour"
+    PROBE_DONE["$profile"]=1
+    rm -rf "$probe_home" "$probe_workspace" "$stdout_file" "$stderr_file"
+    return 0
+  fi
+
+  rm -rf "$probe_home" "$probe_workspace" "$stdout_file" "$stderr_file"
+  return 1
+}
+
+probe_profile_limits_if_needed() {
+  local profile="$1"
+
+  [[ -n "${PROBE_DONE[$profile]:-}" ]] && return 0
+
+  stderr_note "Auto-switch: probing live limits for '$profile'..."
+  if live_probe_profile_limits "$profile"; then
+    return 0
+  fi
+
+  stderr_note "Auto-switch: live probe failed for '$profile'; falling back to cached limits."
+  load_limits_cache_into_memory "$profile"
+}
+
+metric_score() {
+  local metric="${1:-}"
+
+  if [[ "$metric" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$metric"
+  else
+    printf '%s\n' "-1"
+  fi
+}
+
+is_below_threshold() {
+  local metric="${1:-}"
+  local threshold="${2:-}"
+
+  [[ "$metric" =~ ^[0-9]+$ ]] || return 1
+  (( metric < threshold ))
+}
+
+auto_switch_trigger_reason() {
+  local profile="$1"
+  local weekly five_hour reasons=()
+
+  probe_profile_limits_if_needed "$profile"
+  weekly="${PROBE_WEEKLY[$profile]:-}"
+  five_hour="${PROBE_FIVE[$profile]:-}"
+
+  if [[ -z "$weekly" && -z "$five_hour" ]]; then
+    printf 'limits unavailable\n'
+    return 0
+  fi
+
+  case "$AUTO_SWITCH_POLICY" in
+    weekly_only)
+      if is_below_threshold "$weekly" "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT"; then
+        printf 'weekly %s%% < %s%%\n' "$weekly" "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT"
+      fi
+      ;;
+    and)
+      if is_below_threshold "$weekly" "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT" && \
+         is_below_threshold "$five_hour" "$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT"; then
+        printf 'weekly %s%% < %s%% and five-hour %s%% < %s%%\n' \
+          "$weekly" "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT" \
+          "$five_hour" "$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT"
+      fi
+      ;;
+    or)
+      if is_below_threshold "$weekly" "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT"; then
+        reasons+=("weekly ${weekly}% < ${AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT}%")
+      fi
+      if is_below_threshold "$five_hour" "$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT"; then
+        reasons+=("five-hour ${five_hour}% < ${AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT}%")
+      fi
+      if [[ "${#reasons[@]}" -gt 0 ]]; then
+        printf '%s\n' "$(IFS='; '; printf '%s' "${reasons[*]}")"
+      fi
+      ;;
+  esac
+}
+
+choose_best_profile_record() {
+  local default_profile="$1"
+  shift
+  local profiles=("$@")
+  local best_profile="" best_weekly_score=-1 best_five_score=-1
+  local best_weekly="" best_five=""
+  local profile weekly five_hour weekly_score five_score
+
+  for profile in "${profiles[@]}"; do
+    probe_profile_limits_if_needed "$profile"
+    weekly="${PROBE_WEEKLY[$profile]:-}"
+    five_hour="${PROBE_FIVE[$profile]:-}"
+    weekly_score="$(metric_score "$weekly")"
+    five_score="$(metric_score "$five_hour")"
+
+    if [[ -z "$best_profile" ]] || \
+       (( weekly_score > best_weekly_score )) || \
+       (( weekly_score == best_weekly_score && five_score > best_five_score )); then
+      best_profile="$profile"
+      best_weekly_score="$weekly_score"
+      best_five_score="$five_score"
+      best_weekly="$weekly"
+      best_five="$five_hour"
+      continue
+    fi
+
+    if (( weekly_score == best_weekly_score && five_score == best_five_score )) && \
+       [[ "$profile" == "$default_profile" ]]; then
+      best_profile="$profile"
+      best_weekly_score="$weekly_score"
+      best_five_score="$five_score"
+      best_weekly="$weekly"
+      best_five="$five_hour"
+    fi
+  done
+
+  printf '%s|%s|%s\n' "$best_profile" "$best_weekly" "$best_five"
+}
+
+effective_run_profile() {
+  load_config
+
+  local requested="${1:-}"
+  local default_profile current_profile trigger_reason chosen_profile chosen_weekly chosen_five chosen_record
+  local profiles=()
+  local profile
+
+  if [[ -n "$requested" ]]; then
+    resolve_profile "$requested"
+    return 0
+  fi
+
+  default_profile="$(resolve_profile "")"
+  if [[ "$AUTO_SWITCH_ENABLED" != "true" ]]; then
+    printf '%s\n' "$default_profile"
+    return 0
+  fi
+
+  while IFS= read -r profile; do
+    [[ -n "$profile" ]] || continue
+    profiles+=("$profile")
+  done < <(saved_profiles)
+
+  if [[ "${#profiles[@]}" -eq 0 ]]; then
+    printf '%s\n' "$default_profile"
+    return 0
+  fi
+
+  if [[ "${#profiles[@]}" -eq 1 ]]; then
+    printf '%s\n' "${profiles[0]}"
+    return 0
+  fi
+
+  current_profile="$(match_live_profile || true)"
+  if [[ -n "$current_profile" ]]; then
+    probe_profile_limits_if_needed "$current_profile"
+    trigger_reason="$(auto_switch_trigger_reason "$current_profile" || true)"
+    if [[ -z "$trigger_reason" ]]; then
+      stderr_note "Auto-switch: keeping '$current_profile'. Current limits are above threshold."
+      printf '%s\n' "$current_profile"
+      return 0
+    fi
+    stderr_note "Auto-switch: evaluating alternatives because '$current_profile' hit trigger: $trigger_reason"
+  else
+    stderr_note "Auto-switch: no active saved profile detected; selecting the best profile from live limits."
+  fi
+
+  chosen_record="$(choose_best_profile_record "$default_profile" "${profiles[@]}")"
+  chosen_profile="${chosen_record%%|*}"
+  chosen_five="${chosen_record##*|}"
+  chosen_weekly="${chosen_record#*|}"
+  chosen_weekly="${chosen_weekly%%|*}"
+  if [[ -z "$chosen_profile" ]]; then
+    stderr_note "Auto-switch: unable to score profiles, falling back to '$default_profile'."
+    printf '%s\n' "$default_profile"
+    return 0
+  fi
+
+  [[ -n "$chosen_weekly" ]] || chosen_weekly="unknown"
+  [[ -n "$chosen_five" ]] || chosen_five="unknown"
+  stderr_note "Auto-switch: selected '$chosen_profile' (weekly=${chosen_weekly}%, five-hour=${chosen_five}%)."
+  printf '%s\n' "$chosen_profile"
+}
+
+command_list() {
+  ensure_dirs
+
+  local default_profile live_profile profile_path profile_name found=0 tags
+  default_profile="$(get_default_profile || true)"
+  live_profile="$(match_live_profile || true)"
+
+  for profile_path in "$ACCOUNTS_HOME"/*.auth.json; do
+    [[ -f "$profile_path" ]] || continue
+    found=1
+    profile_name="${profile_path##*/}"
+    profile_name="${profile_name%.auth.json}"
+    tags=()
+
+    if [[ "$profile_name" == "$live_profile" ]]; then
+      tags+=("active")
+    fi
+
+    if [[ "$profile_name" == "$default_profile" ]]; then
+      tags+=("default")
+    fi
+
+    if [[ "${#tags[@]}" -gt 0 ]]; then
+      printf '%s (%s)\n' "$profile_name" "$(IFS=', '; printf '%s' "${tags[*]}")"
+    else
+      printf '%s\n' "$profile_name"
+    fi
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    note "No saved Codex auth profiles yet."
+  fi
+}
+
+reset_probe_memory_for_profile() {
+  local profile="$1"
+
+  unset 'PROBE_WEEKLY[$profile]'
+  unset 'PROBE_FIVE[$profile]'
+  unset 'PROBE_DONE[$profile]'
+  unset 'PROBE_OBSERVED[$profile]'
+}
+
+print_limits_table() {
+  ensure_dirs
+
+  local default_profile live_profile found=0
+  local profile weekly five_hour observed_at tags status_text weekly_display five_hour_display
+
+  default_profile="$(get_default_profile || true)"
+  live_profile="$(match_live_profile || true)"
+
+  printf '%-16s %-8s %-8s %-24s %s\n' "Profile" "Weekly" "5-hour" "Observed" "Status"
+
+  while IFS= read -r profile; do
+    [[ -n "$profile" ]] || continue
+    found=1
+
+    load_limits_cache_into_memory "$profile"
+    weekly="${PROBE_WEEKLY[$profile]:-}"
+    five_hour="${PROBE_FIVE[$profile]:-}"
+    observed_at="${PROBE_OBSERVED[$profile]:-}"
+    tags=()
+
+    if [[ -n "$weekly" ]]; then
+      weekly_display="${weekly}%"
+    else
+      weekly_display="unknown"
+    fi
+    if [[ -n "$five_hour" ]]; then
+      five_hour_display="${five_hour}%"
+    else
+      five_hour_display="unknown"
+    fi
+    [[ -n "$observed_at" ]] || observed_at="never"
+
+    if [[ "$profile" == "$live_profile" ]]; then
+      tags+=("active")
+    fi
+    if [[ "$profile" == "$default_profile" ]]; then
+      tags+=("default")
+    fi
+
+    if [[ "${#tags[@]}" -gt 0 ]]; then
+      status_text="$(IFS=', '; printf '%s' "${tags[*]}")"
+    else
+      status_text="-"
+    fi
+
+    printf '%-16s %-8s %-8s %-24s %s\n' \
+      "$profile" "$weekly_display" "$five_hour_display" "$observed_at" "$status_text"
+  done < <(saved_profiles)
+
+  if [[ "$found" -eq 0 ]]; then
+    note "No saved Codex auth profiles yet."
+  fi
+}
+
+command_limits_refresh() {
+  ensure_dirs
+
+  local requested_profile="${1:-}"
+  local profiles=()
+  local profile refreshed=0
+
+  if [[ -n "$requested_profile" ]]; then
+    validate_profile_name "$requested_profile"
+    profiles=("$requested_profile")
+  else
+    while IFS= read -r profile; do
+      [[ -n "$profile" ]] || continue
+      profiles+=("$profile")
+    done < <(saved_profiles)
+  fi
+
+  if [[ "${#profiles[@]}" -eq 0 ]]; then
+    note "No saved Codex auth profiles yet."
+    return 0
+  fi
+
+  for profile in "${profiles[@]}"; do
+    import_legacy_profile_if_needed "$profile"
+    if [[ ! -f "$(account_path "$profile")" ]]; then
+      die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
+    fi
+
+    reset_probe_memory_for_profile "$profile"
+    if probe_profile_limits_if_needed "$profile"; then
+      refreshed=1
+    fi
+  done
+
+  if [[ "$refreshed" -eq 0 ]]; then
+    stderr_note "No live limits could be refreshed. Showing last known values."
+  fi
+
+  print_limits_table
+}
+
+command_limits() {
+  local subcommand="${1:-show}"
+  shift || true
+
+  case "$subcommand" in
+    show)
+      print_limits_table
+      ;;
+    refresh)
+      command_limits_refresh "$@"
+      ;;
+    *)
+      die "Unknown limits command '$subcommand'. Use: limits, limits refresh [profile]."
+      ;;
+  esac
+}
+
+command_current() {
+  local profile
+
+  profile="$(get_default_profile || true)"
+  if [[ -n "$profile" ]]; then
+    note "$profile"
+  else
+    note "No default profile set."
+  fi
+}
+
+command_use() {
+  local profile="${1:-}"
+
+  validate_profile_name "$profile"
+  ensure_dirs
+  import_legacy_profile_if_needed "$profile"
+  if is_consumer_mode; then
+    [[ -f "$(account_path "$profile")" ]] || die "Unknown profile '$profile'."
+  fi
+  set_default_profile "$profile"
+  note "Default profile set to '$profile'."
+}
+
+command_path() {
+  local profile="${1:-}"
+
+  validate_profile_name "$profile"
+  ensure_dirs
+  note "$(account_path "$profile")"
+}
+
+command_save() {
+  local profile="${1:-}"
+
+  deny_consumer_credential_write "save"
+  validate_profile_name "$profile"
+  ensure_dirs
+  save_live_auth_as_profile "$profile"
+  set_current_profile "$profile"
+  note "Saved live auth as '$profile'."
+}
+
+login_codex_bin() {
+  if [[ -n "${CODEX_LOGIN_BIN:-}" ]]; then
+    printf '%s\n' "$CODEX_LOGIN_BIN"
+  elif command -v codex-real >/dev/null 2>&1; then
+    command -v codex-real
+  else
+    printf '%s\n' "$CODEX_BIN"
+  fi
+}
+
+command_login() {
+  local profile="${1:-}"
+  local login_home login_bin source exit_status
+
+  deny_consumer_credential_write "login"
+  validate_profile_name "$profile"
+  ensure_dirs
+
+  login_home="$(mktemp -d "$PROFILE_STORE/login-$profile.XXXXXX")"
+  chmod 700 "$login_home" 2>/dev/null || true
+  login_bin="$(login_codex_bin)"
+
+  note "Using isolated CODEX_HOME=$login_home"
+  if CODEX_HOME="$login_home" "$login_bin" login --device-auth; then
+    source="$login_home/auth.json"
+    [[ -f "$source" ]] || { rm -rf "$login_home"; die "Login completed but no auth.json was created in isolated CODEX_HOME."; }
+    copy_file_secure "$source" "$(account_path "$profile")"
+    rm -rf "$login_home"
+    note "Saved login auth as '$profile'. Live auth unchanged. Run '$PROGRAM use $profile' to activate it."
+  else
+    exit_status=$?
+    rm -rf "$login_home"
+    return "$exit_status"
+  fi
+}
+
+command_status() {
+  local profile="${1:-}"
+  local live_profile="" saved_state="missing"
+
+  ensure_dirs
+
+  if [[ -n "$profile" ]]; then
+    validate_profile_name "$profile"
+    import_legacy_profile_if_needed "$profile"
+    [[ -f "$(account_path "$profile")" ]] && saved_state="saved"
+  fi
+
+  CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" login status
+  live_profile="$(match_live_profile || true)"
+
+  if [[ -n "$profile" ]]; then
+    if [[ "$saved_state" == "missing" ]]; then
+      note "Profile '$profile': no saved auth snapshot."
+    elif [[ "$live_profile" == "$profile" ]]; then
+      note "Profile '$profile': saved and active."
+    else
+      note "Profile '$profile': saved but not active."
+    fi
+  elif [[ -n "$live_profile" ]]; then
+    note "Active saved profile: $live_profile"
+  fi
+}
+
+command_config_show() {
+  load_config
+
+  note "Config file: $CONFIG_FILE"
+  printf '[auto_switch]\n'
+  printf 'enabled = %s\n' "$AUTO_SWITCH_ENABLED"
+  printf 'weekly_threshold_percent = %s\n' "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT"
+  printf 'five_hour_threshold_percent = %s\n' "$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT"
+  printf 'policy = "%s"\n' "$AUTO_SWITCH_POLICY"
+  printf 'fallback = "%s"\n' "$AUTO_SWITCH_FALLBACK"
+}
+
+command_config_set() {
+  local key="${1:-}"
+  local value="${2:-}"
+
+  [[ -n "$key" ]] || die "Usage: $PROGRAM config set <key> <value>"
+  [[ -n "$value" ]] || die "Usage: $PROGRAM config set <key> <value>"
+
+  load_config
+
+  case "$key" in
+    auto_switch.enabled)
+      case "$value" in
+        true|false)
+          AUTO_SWITCH_ENABLED="$value"
+          ;;
+        *)
+          die "auto_switch.enabled must be true or false."
+          ;;
+      esac
+      ;;
+    auto_switch.weekly_threshold_percent)
+      validate_percent "$value"
+      AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT="$value"
+      ;;
+    auto_switch.five_hour_threshold_percent)
+      validate_percent "$value"
+      AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT="$value"
+      ;;
+    auto_switch.policy)
+      validate_policy "$value"
+      AUTO_SWITCH_POLICY="$value"
+      ;;
+    auto_switch.fallback)
+      validate_fallback "$value"
+      AUTO_SWITCH_FALLBACK="$value"
+      ;;
+    *)
+      die "Unknown config key '$key'."
+      ;;
+  esac
+
+  write_config
+  note "Updated $key."
+}
+
+require_whiptail() {
+  command -v whiptail >/dev/null 2>&1 || die "whiptail is required for 'config tui'."
+}
+
+whiptail_capture() {
+  whiptail "$@" 3>&1 1>&2 2>&3
+}
+
+config_summary_text() {
+  local default_profile=""
+
+  default_profile="$(get_default_profile || true)"
+  [[ -n "$default_profile" ]] || default_profile="unset"
+
+  printf 'Config file: %s\n' "$CONFIG_FILE"
+  printf 'Auto-switch enabled: %s\n' "$AUTO_SWITCH_ENABLED"
+  printf 'Weekly threshold: %s%%\n' "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT"
+  printf '5-hour threshold: %s%%\n' "$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT"
+  printf 'Policy: %s\n' "$AUTO_SWITCH_POLICY"
+  printf 'Fallback: %s\n' "$AUTO_SWITCH_FALLBACK"
+  printf 'Default profile: %s\n' "$default_profile"
+  printf '\n'
+  printf 'Auto-switch only affects: codex-profile run\n'
+  printf 'Explicit profile runs stay fixed on the chosen profile.\n'
+}
+
+list_codex_path_candidates() {
+  type -aP codex 2>/dev/null | awk '!seen[$0]++'
+}
+
+detect_real_codex_binary() {
+  local script_path="$1"
+  local wrapper_path="$2"
+  local real_path="$3"
+  local wrapper_abs real_abs candidate candidate_resolved
+
+  wrapper_abs="$(absolute_target_path "$wrapper_path")"
+  real_abs="$(absolute_target_path "$real_path")"
+
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    candidate_resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
+    [[ -n "$candidate_resolved" ]] || continue
+
+    if [[ "$candidate_resolved" == "$script_path" || "$candidate_resolved" == "$wrapper_abs" || "$candidate_resolved" == "$real_abs" ]]; then
+      continue
+    fi
+
+    printf '%s\n' "$candidate_resolved"
+    return 0
+  done < <(list_codex_path_candidates)
+
+  return 1
+}
+
+render_wrapper_script() {
+  local script_path="$1"
+  local real_path="$2"
+
+  cat <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Generated by codex-profile install-wrapper.
+exec env CODEX_BIN="$real_path" "$script_path" run -- "\$@"
+EOF
+}
+
+command_install_wrapper() {
+  local force=0
+  local wrapper_path="$HOME/.local/bin/codex"
+  local real_path="$HOME/.local/bin/codex-real"
+  local explicit_codex_bin=""
+  local script_path wrapper_dir real_dir real_source existing_real wrapper_content existing_wrapper=""
+  local tmp_file
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force)
+        force=1
+        ;;
+      --wrapper-path)
+        shift || die "Missing value for --wrapper-path."
+        wrapper_path="${1:-}"
+        [[ -n "$wrapper_path" ]] || die "Missing value for --wrapper-path."
+        ;;
+      --real-path)
+        shift || die "Missing value for --real-path."
+        real_path="${1:-}"
+        [[ -n "$real_path" ]] || die "Missing value for --real-path."
+        ;;
+      --codex-bin)
+        shift || die "Missing value for --codex-bin."
+        explicit_codex_bin="${1:-}"
+        [[ -n "$explicit_codex_bin" ]] || die "Missing value for --codex-bin."
+        ;;
+      -h|--help)
+        install_wrapper_usage
+        return 0
+        ;;
+      *)
+        die "Unknown install-wrapper option '$1'."
+        ;;
+    esac
+    shift || true
+  done
+
+  wrapper_path="$(absolute_target_path "$wrapper_path")"
+  real_path="$(absolute_target_path "$real_path")"
+  script_path="$(resolve_existing_path "${BASH_SOURCE[0]}")"
+
+  [[ "$wrapper_path" != "$real_path" ]] || die "Wrapper path and real Codex path must be different."
+  [[ "$wrapper_path" != "$script_path" ]] || die "Wrapper path cannot point to this script."
+  [[ "$real_path" != "$script_path" ]] || die "Real Codex path cannot point to this script."
+
+  wrapper_dir="$(dirname "$wrapper_path")"
+  real_dir="$(dirname "$real_path")"
+  mkdir -p "$wrapper_dir" "$real_dir"
+
+  if [[ -n "$explicit_codex_bin" ]]; then
+    real_source="$(resolve_existing_path "$explicit_codex_bin")"
+  elif [[ -e "$real_path" ]]; then
+    real_source="$(resolve_existing_path "$real_path")"
+  else
+    real_source="$(detect_real_codex_binary "$script_path" "$wrapper_path" "$real_path" || true)"
+  fi
+
+  [[ -n "$real_source" ]] || die "Could not detect the real Codex binary. Re-run with --codex-bin PATH."
+  [[ -x "$real_source" ]] || die "Resolved Codex binary '$real_source' is not executable."
+  [[ "$real_source" != "$script_path" ]] || die "The detected real Codex binary points back to this script."
+  [[ "$real_source" != "$wrapper_path" ]] || die "The detected real Codex binary points to the wrapper path."
+  [[ "$real_source" != "$real_path" ]] || die "The detected real Codex binary points to the codex-real link path."
+
+  if [[ -e "$real_path" ]]; then
+    existing_real="$(resolve_existing_path "$real_path")"
+    if [[ "$existing_real" != "$real_source" && "$force" -ne 1 ]]; then
+      die "Refusing to overwrite existing '$real_path'. Re-run with --force if you want to replace it."
+    fi
+  fi
+
+  wrapper_content="$(render_wrapper_script "$script_path" "$real_path")"
+  if [[ -e "$wrapper_path" ]]; then
+    [[ -f "$wrapper_path" ]] || die "Wrapper path '$wrapper_path' exists but is not a regular file."
+    existing_wrapper="$(cat "$wrapper_path")"
+    if [[ "$existing_wrapper" != "$wrapper_content" && "$force" -ne 1 ]]; then
+      die "Refusing to overwrite existing wrapper '$wrapper_path'. Re-run with --force if you want to replace it."
+    fi
+  fi
+
+  ln -sfn "$real_source" "$real_path"
+
+  tmp_file="$(mktemp "${wrapper_path}.tmp.XXXXXX")"
+  printf '%s\n' "$wrapper_content" >"$tmp_file"
+  chmod 755 "$tmp_file"
+  mv "$tmp_file" "$wrapper_path"
+
+  note "Installed Codex wrapper at '$wrapper_path'."
+  note "Preserved real Codex binary as '$real_path' -> '$real_source'."
+  note "The wrapper now launches Codex through '$PROGRAM run' without recursive symlink loops."
+}
+
+config_tui_toggle_enabled() {
+  local prompt="Auto-switch is currently '$AUTO_SWITCH_ENABLED'. Toggle it?"
+
+  if whiptail --title "codex-profile" --yesno "$prompt" 10 70; then
+    if [[ "$AUTO_SWITCH_ENABLED" == "true" ]]; then
+      AUTO_SWITCH_ENABLED="false"
+    else
+      AUTO_SWITCH_ENABLED="true"
+    fi
+    write_config
+  fi
+}
+
+config_tui_edit_threshold() {
+  local key="$1"
+  local label="$2"
+  local current_value="$3"
+  local input=""
+
+  while true; do
+    input="$(whiptail_capture --title "codex-profile" --inputbox "Set $label (0-100)." 10 70 "$current_value")" || return 0
+    input="$(trim "$input")"
+
+    if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 0 && input <= 100 )); then
+      break
+    fi
+
+    whiptail --title "codex-profile" --msgbox "Enter a whole number between 0 and 100." 8 60
+    current_value="$input"
+  done
+
+  case "$key" in
+    weekly)
+      AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT="$input"
+      ;;
+    five_hour)
+      AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT="$input"
+      ;;
+  esac
+
+  write_config
+}
+
+config_tui_edit_policy() {
+  local choice=""
+
+  choice="$(whiptail_capture --title "codex-profile" --menu "Select auto-switch policy." 14 72 4 \
+    "or" "Switch when weekly OR 5-hour falls below threshold." \
+    "and" "Switch only when both weekly AND 5-hour fall below threshold." \
+    "weekly_only" "Switch based only on the weekly threshold." \
+    "cancel" "Return without changing anything.")" || return 0
+
+  [[ "$choice" == "cancel" ]] && return 0
+  validate_policy "$choice"
+  AUTO_SWITCH_POLICY="$choice"
+  write_config
+}
+
+config_tui_select_default_profile() {
+  local profiles=()
+  local profile choice=""
+
+  while IFS= read -r profile; do
+    [[ -n "$profile" ]] || continue
+    profiles+=("$profile" "$profile")
+  done < <(saved_profiles)
+
+  if [[ "${#profiles[@]}" -eq 0 ]]; then
+    whiptail --title "codex-profile" --msgbox "No saved profiles are available yet." 8 60
+    return 0
+  fi
+
+  choice="$(whiptail_capture --title "codex-profile" --menu "Select the default profile." 16 72 8 "${profiles[@]}")" || return 0
+  validate_profile_name "$choice"
+  set_default_profile "$choice"
+}
+
+command_config_tui() {
+  local selection=""
+  local default_profile=""
+
+  require_whiptail
+  ensure_dirs
+
+  while true; do
+    load_config
+    default_profile="$(get_default_profile || true)"
+    [[ -n "$default_profile" ]] || default_profile="unset"
+
+    selection="$(whiptail_capture --title "codex-profile" --menu "Configure codex-profile." 20 78 10 \
+      "toggle_auto_switch" "Enabled: $AUTO_SWITCH_ENABLED" \
+      "weekly_threshold" "Weekly threshold: ${AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT}%" \
+      "five_hour_threshold" "5-hour threshold: ${AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT}%" \
+      "policy" "Policy: $AUTO_SWITCH_POLICY" \
+      "default_profile" "Default profile: $default_profile" \
+      "show_config" "Show effective config" \
+      "exit" "Exit the TUI")" || break
+
+    case "$selection" in
+      toggle_auto_switch)
+        config_tui_toggle_enabled
+        ;;
+      weekly_threshold)
+        config_tui_edit_threshold "weekly" "weekly threshold percent" "$AUTO_SWITCH_WEEKLY_THRESHOLD_PERCENT"
+        ;;
+      five_hour_threshold)
+        config_tui_edit_threshold "five_hour" "5-hour threshold percent" "$AUTO_SWITCH_FIVE_HOUR_THRESHOLD_PERCENT"
+        ;;
+      policy)
+        config_tui_edit_policy
+        ;;
+      default_profile)
+        config_tui_select_default_profile
+        ;;
+      show_config)
+        whiptail --title "codex-profile" --msgbox "$(config_summary_text)" 16 78
+        ;;
+      exit)
+        break
+        ;;
+    esac
+  done
+}
+
+command_pi() {
+  local subcommand="${1:-help}"
+  shift || true
+
+  deny_consumer_credential_write "pi $subcommand"
+
+  case "$subcommand" in
+    save)
+      local profile="${1:-}"
+      validate_profile_name "$profile"
+      ensure_dirs
+      save_pi_auth_as_profile "$profile"
+      note "Saved Pi auth as '$profile'."
+      ;;
+    use)
+      local profile="${1:-}"
+      validate_profile_name "$profile"
+      ensure_dirs
+      switch_pi_profile "$profile"
+      note "Restored Codex and Pi auth for '$profile'."
+      ;;
+    run)
+      command_pi_run "$@"
+      ;;
+    login)
+      local profile="${1:-}"
+      validate_profile_name "$profile"
+      note "Pi OAuth is interactive. Run 'pi' and complete login, then run: $PROGRAM pi save $profile"
+      ;;
+    convert)
+      local profile="${1:-}"
+      validate_profile_name "$profile"
+      ensure_dirs
+      save_pi_auth_from_codex_profile "$profile"
+      note "Converted Codex auth snapshot to Pi auth for '$profile'."
+      ;;
+    sync)
+      local profile="${1:-}"
+      validate_profile_name "$profile"
+      ensure_dirs
+      sync_pi_auth_from_codex_profile "$profile"
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      die "Unknown pi command '$subcommand'. Use: save, use, run, login, convert, sync."
+      ;;
+  esac
+}
+
+command_pi_run() {
+  local profile="${1:-}"
+  local args=()
+  local explicit_profile=0
+  local selected_profile
+  local exit_status=0
+
+  if [[ "${1:-}" == "--" ]]; then
+    profile=""
+  elif [[ -n "${1:-}" ]]; then
+    profile="$(resolve_profile "$1")"
+    explicit_profile=1
+    shift
+  else
+    profile=""
+  fi
+
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+
+  args=("$@")
+
+  # A decoupled AUTH_FILE voids the account guarantee, so it is refused before
+  # anything is written or started (Pi reads the Codex auth of this home too).
+  require_coupled_auth_file || return 1
+
+  ensure_dirs
+
+  if [[ "$explicit_profile" -eq 1 ]]; then
+    selected_profile="$profile"
+  else
+    selected_profile="$(effective_run_profile "")"
+  fi
+
+  switch_pi_profile "$selected_profile"
+
+  # Pi sessions run against the same Codex auth and its app-server daemon: a
+  # daemon that cannot be verified (rc 1) or is known to still serve the
+  # previous account (rc 2) must not be used.
+  if [[ "$LAST_DAEMON_INVALIDATION_RC" -ge 1 && "${CODEX_PROFILE_ALLOW_STALE_DAEMON:-0}" != "1" ]]; then
+    refuse_stale_daemon "Starting Pi now" || return 1
+  fi
+
+  "$PI_BIN" "${args[@]}" || exit_status=$?
+  return "$exit_status"
+}
+
+command_config() {
+  local subcommand="${1:-show}"
+  shift || true
+
+  case "$subcommand" in
+    show)
+      command_config_show "$@"
+      ;;
+    set)
+      command_config_set "$@"
+      ;;
+    tui)
+      command_config_tui "$@"
+      ;;
+    *)
+      die "Unknown config command '$subcommand'. Use: show, set, tui."
+      ;;
+  esac
+}
+
+command_setup() {
+  command_config_tui "$@"
+}
+
+command_run() {
+  local profile="${1:-}"
+  local args=()
+  local explicit_profile=0
+  local selected_profile
+  local exit_status=0
+  local is_exec=0
+  local is_auth_writer=0
+  local auth_writer_invalidation_rc=0
+
+  if [[ "${1:-}" == "--" ]]; then
+    profile=""
+  elif [[ -n "${1:-}" ]]; then
+    profile="$(resolve_profile "$1")"
+    explicit_profile=1
+    shift
+  else
+    profile=""
+  fi
+
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+
+  args=("$@")
+
+  # A one-shot "run -- exec ..." session never talks to the app-server daemon,
+  # so a daemon that could not be invalidated is only reported for it.
+  if [[ "${args[0]:-}" == "exec" ]]; then
+    is_exec=1
+  fi
+
+  # "run -- login ..." / "run -- logout ..." (and a `codex login`/`codex
+  # logout` through the wrapper) are also one-shots, but they can rewrite or
+  # clear the live auth AFTER the pre-flight check, so they need a second
+  # invalidation once they finish.
+  if [[ "${args[0]:-}" == "login" || "${args[0]:-}" == "logout" ]]; then
+    is_auth_writer=1
+  fi
+
+  # Every run mode (session, one-shot, login/logout) shares the same auth file,
+  # so a decoupled AUTH_FILE is refused before anything is written or started.
+  require_coupled_auth_file || return 1
+
+  ensure_dirs
+
+  if [[ "$explicit_profile" -eq 1 ]]; then
+    selected_profile="$profile"
+  else
+    selected_profile="$(effective_run_profile "")"
+  fi
+
+  switch_profile "$selected_profile"
+
+  if [[ "$LAST_DAEMON_INVALIDATION_RC" -ge 1 && "$is_exec" -eq 0 && "$is_auth_writer" -eq 0 \
+        && "${CODEX_PROFILE_ALLOW_STALE_DAEMON:-0}" != "1" ]]; then
+    refuse_stale_daemon "Opening a session now" || return 1
+  fi
+
+  env CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" "${args[@]}" || exit_status=$?
+
+  if [[ "$is_auth_writer" -eq 1 ]]; then
+    # The login/logout may have replaced or cleared the live auth; the daemon
+    # invalidated before the command was born with the previous account.
+    invalidate_managed_daemon || auth_writer_invalidation_rc=$?
+    if [[ "$auth_writer_invalidation_rc" -ge 1 ]]; then
+      stderr_note "warning: the app-server daemon may still be serving the account that was live before this login/logout; retry sessions once it stops."
+    fi
+  fi
+
+  return "$exit_status"
+}
+
+main() {
+  local command="${1:-help}"
+  shift || true
+
+  case "$command" in
+    help|-h|--help)
+      usage
+      ;;
+    install-wrapper)
+      command_install_wrapper "$@"
+      ;;
+    list)
+      command_list "$@"
+      ;;
+    limits)
+      command_limits "$@"
+      ;;
+    setup)
+      command_setup "$@"
+      ;;
+    current)
+      command_current "$@"
+      ;;
+    use)
+      command_use "$@"
+      ;;
+    path)
+      command_path "$@"
+      ;;
+    save)
+      command_save "$@"
+      ;;
+    login)
+      command_login "$@"
+      ;;
+    status)
+      command_status "$@"
+      ;;
+    config)
+      command_config "$@"
+      ;;
+    pi)
+      command_pi "$@"
+      ;;
+    run)
+      command_run "$@"
+      ;;
+    *)
+      validate_profile_name "$command"
+      command_run "$command" "$@"
+      ;;
+  esac
+}
+
+main "$@"

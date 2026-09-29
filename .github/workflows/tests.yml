@@ -1,0 +1,20 @@
+name: Contract tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y jq
+      - run: bash -n bin/codex-profile bin/codex-profile-consumer
+      - run: python3 -m unittest discover -s tests -p 'test_codex_profiles.py'
+      - run: bash tests/test_consumer_daemon.sh
