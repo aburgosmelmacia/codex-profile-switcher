@@ -96,7 +96,8 @@ codex-profile setup
 
 Under the hood, `login` runs Codex device auth in an isolated temporary `CODEX_HOME`, saves only the resulting `auth.json` snapshot, and leaves the live shared auth unchanged until you run `use` or `run`.
 
-Optionally set a default profile:
+Activate a profile and set it as the default (also updates the Pi Codex auth block;
+if needed, it builds that profile's Pi snapshot first):
 
 ```bash
 codex-profile use work
@@ -251,8 +252,79 @@ Useful commands:
 - Auto-switch applies only to `codex-profile run`/`codex-profile pi run` without an explicit profile.
 - `codex-profile config tui` requires `whiptail` to be installed.
 - This tool imports legacy auth automatically from `~/.codex-profiles/<profile>/auth.json` if present.
-- This tool does not modify a running Codex process. If you already have a Codex session open, start a new one with the desired profile.
+- Existing interactive Codex sessions are not switched. Open a new session after selecting a different account.
+- Successful auth changes invalidate a stale managed `app-server` daemon before starting a new session (see below).
 - Use `codex-profile install-wrapper --force` if you intentionally want to replace an existing `codex` wrapper or `codex-real` link.
+
+## Managed app-server freshness (Linux)
+
+A long-lived Codex `app-server` daemon can keep using the previous account even after
+`auth.json` changes. Successful auth changes now check its identity and freshness;
+`run -- login` and `run -- logout` also perform the check after Codex exits.
+
+- A daemon is fresh only if it started **strictly after** the effective auth file's mtime.
+- Signalling requires a verified `app-server` command, boot ID, process start ticks and
+  Linux pidfd. Only absence or a zombie confirms that the old process stopped.
+- An unverifiable or surviving stale daemon blocks a new launch. The explicit escape
+  `CODEX_PROFILE_ALLOW_STALE_DAEMON=1` bypasses that block; use it only if you knowingly
+  accept that the new session may use stale credentials.
+- Interactive launches and Pi launches require an `AUTH_FILE` override to refer to
+  the effective shared `CODEX_HOME/auth.json`. The normal variant deliberately exempts
+  `exec`/`login`/`logout` one-shots (which still check/invalidate the managed daemon).
+  The consumer variant enforces coupling in all launch modes.
+
+## Centrally managed consumers
+
+`bin/codex-profile-consumer` preserves the separately reviewed system variant used by
+access-only consumers. It is **not** the default binary and is not installed automatically.
+The two variants deliberately differ: normal `use` activates Codex and Pi transactionally;
+consumer `use` sets the default without changing live credentials. Do not replace a
+consumer installation with the normal binary.
+
+Consumer mode is selected by `CODEX_PROFILE_CONSUMER=1` or the `.consumer` marker in the
+profile store. Snapshots are supplied by an external central distributor; no distributor,
+auth file, token or host-specific service configuration is included in this repository.
+Consumer mode prevents saving live auth back to snapshots and denies consumer-side
+credential publication/Pi switching. The system variant also requires the live auth file
+to be owned by the consumer with exact mode `0600`, and its directory to be `0700`.
+
+Installing the binary alone does **not** enable consumer mode. Before deployment,
+ensure every consumer wrapper exports `CODEX_PROFILE_CONSUMER=1`, or that the central
+distributor creates the `.consumer` marker in each consumer's profile store. Without
+that environment/marker, consumer-only protections do not apply.
+
+To install that variant deliberately (review your existing installation first):
+
+```bash
+sudo install -m 0755 bin/codex-profile-consumer /usr/local/bin/codex-profile
+```
+
+## Tests
+
+All credentials and daemons used by these checks are synthetic. Tests do not contact
+Codex or change an existing user's profile.
+
+```bash
+python3 -m unittest discover -s tests -p 'test_codex_profiles.py'
+bash tests/test_consumer_daemon.sh
+```
+
+These tests require GNU/Linux (`/proc`, pidfds and GNU utilities). The normal variant
+has 61 contract tests; the consumer daemon harness has 42 cases. Cross-user cases use
+non-interactive sudo when available, otherwise report skips. Two cgroup-freezer tests
+are skipped unless explicitly enabled with `CODEX_PROFILE_TEST_ROOT_CGROUP=1` on a
+throwaway host: they create a temporary root process/cgroup and cannot guarantee
+cleanup after a hard kill. CI deliberately leaves that opt-in unset on ephemeral
+GitHub-hosted runners with read-only repository permissions.
+
+The consumer variant conservatively invalidates daemon metadata it cannot parse;
+English weekday/month metadata under a non-English locale may therefore cause extra
+invalidation. Its test harness fixes `LC_ALL=C`; no installed binary is changed here.
+An account-changing bare `codex login` may also make the normal variant reject an
+implicit snapshot refresh, rather than overwrite a saved account. Save the new account
+under its own profile name before continuing; this fail-closed behavior is intentional.
+Seven integration tests for the operator's external token manager remain on the host;
+that unrelated script is intentionally not included here.
 
 ## Security
 

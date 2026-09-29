@@ -9,6 +9,8 @@ PI_BIN="${PI_BIN:-pi}"
 SHARED_CODEX_HOME="${CODEX_SHARED_HOME:-${CODEX_HOME:-$HOME/.codex}}"
 AUTH_FILE="${AUTH_FILE:-$SHARED_CODEX_HOME/auth.json}"
 PROFILE_STORE="${CODEX_PROFILE_STORE:-$SHARED_CODEX_HOME/.codex-profile}"
+PROFILE_LOCK_FILE="$PROFILE_STORE/accounts.lock"
+PROFILE_LOCK_HELD=0
 ACCOUNTS_HOME="${CODEX_AUTH_PROFILES_HOME:-$PROFILE_STORE/accounts}"
 LIMITS_HOME="${CODEX_PROFILE_LIMITS_HOME:-$PROFILE_STORE/limits}"
 DEFAULT_FILE="${CODEX_PROFILE_DEFAULT_FILE:-$PROFILE_STORE/.default-profile}"
@@ -122,6 +124,8 @@ Usage:
   $PROGRAM pi use <profile>
   $PROGRAM pi run [profile] [-- <pi args...>]
   $PROGRAM pi login <profile>
+  $PROGRAM pi convert <profile>
+  $PROGRAM pi sync <profile>
   $PROGRAM run [profile] [-- <codex args...>]
   $PROGRAM <profile> [-- <codex args...>]
 
@@ -145,7 +149,8 @@ Commands:
       Show the default profile.
 
   use <profile>
-      Set the default profile.
+      Activate the profile for Codex and Pi (building the Pi snapshot from the
+      Codex auth when missing) and make it the default.
 
   path <profile>
       Print the saved auth snapshot path for a profile.
@@ -158,8 +163,11 @@ Commands:
       resulting auth.json as the named profile.
 
   status [profile]
-      Show live login status. If a profile is provided, also report whether its
-      saved auth snapshot exists and whether it is active.
+      Show live login status plus the account id of the live Codex and Pi auth,
+      the default profile and every saved profile, and warn when the live Pi
+      auth does not match the active profile, or when the live Codex and Pi
+      auth are on different accounts. If a profile is provided, also report
+      whether its saved auth snapshot exists and whether it is active.
 
   config show
       Show effective auto-switch configuration.
@@ -181,7 +189,9 @@ Commands:
       Save the current Pi openai-codex auth block as the named profile.
 
   pi use <profile>
-      Restore the selected Codex profile and Pi openai-codex auth block.
+      Restore the selected Codex profile and Pi openai-codex auth block. A Pi
+      snapshot saved from a different account than its Codex snapshot is
+      rejected before anything changes ('pi convert' rebuilds it).
 
   pi run [profile] [-- <pi args...>]
       Restore the selected profile for Codex and Pi, then run Pi.
@@ -189,9 +199,20 @@ Commands:
   pi login <profile>
       Explain the manual Pi OAuth flow, then point to 'pi save'.
 
+  pi convert <profile>
+      Rebuild the saved Pi auth snapshot from the saved Codex profile.
+
+  pi sync <profile>
+      Rebuild the Pi snapshot from Codex and update live Pi auth when the
+      profile is currently active. When the Codex snapshot carries no readable
+      JWT expiry, the snapshot is stamped with a computed expiry and may be
+      rewritten again on the next sync.
+
   run [profile] [-- <codex args...>]
       Restore the selected profile's auth.json into the shared CODEX_HOME and
       run Codex there. Sessions, skills, history, and config remain shared.
+      Pi auth is not touched: before any Pi session run '$PROGRAM use <profile>'
+      (or '$PROGRAM pi run <profile>').
       If no profile is passed and auto-switch is enabled, the tool evaluates the
       current profile's limits and may jump to a better saved profile.
 
@@ -230,6 +251,19 @@ ensure_dirs() {
   chmod 700 "$ACCOUNTS_HOME" 2>/dev/null || true
   chmod 700 "$LIMITS_HOME" 2>/dev/null || true
   chmod 700 "$PROBE_ROOT" 2>/dev/null || true
+}
+
+with_profile_lock() {
+  if [[ "$PROFILE_LOCK_HELD" == "1" ]]; then
+    "$@"
+    return
+  fi
+  ensure_dirs
+  (
+    flock -x 9 || return 1
+    PROFILE_LOCK_HELD=1
+    "$@"
+  ) 9>"$PROFILE_LOCK_FILE"
 }
 
 validate_profile_name() {
@@ -296,7 +330,9 @@ limits_cache_path() {
 set_default_profile() {
   local profile="$1"
 
-  printf '%s\n' "$profile" >"$DEFAULT_FILE"
+  # El redirect manda: sin '|| return 1' el 'chmod || true' final enmascaraba
+  # el fallo de escritura y la activación se daba por buena.
+  printf '%s\n' "$profile" >"$DEFAULT_FILE" || return 1
   chmod 600 "$DEFAULT_FILE" 2>/dev/null || true
 }
 
@@ -313,7 +349,7 @@ get_default_profile() {
 set_current_profile() {
   local profile="$1"
 
-  printf '%s\n' "$profile" >"$CURRENT_FILE"
+  printf '%s\n' "$profile" >"$CURRENT_FILE" || return 1
   chmod 600 "$CURRENT_FILE" 2>/dev/null || true
 }
 
@@ -337,16 +373,17 @@ copy_file_secure() {
     target="$(readlink -f "$destination")" || die "Unable to resolve symlink '$destination'."
   fi
 
-  if [[ -e "$target" ]]; then
-    cp "$source" "$target"
+  if [[ "$PROFILE_LOCK_HELD" != "1" ]]; then
+    with_profile_lock copy_file_secure "$source" "$destination"
+    return
+  fi
+  target_dir="$(dirname "$target")"
+  tmp_file="$(mktemp "$target_dir/.${target##*/}.tmp.XXXXXX")" || return 1
+  if cp "$source" "$tmp_file" && chmod 600 "$tmp_file" && mv -f "$tmp_file" "$target"; then
     return 0
   fi
-
-  target_dir="$(dirname "$target")"
-  tmp_file="$(mktemp "$target_dir/.${target##*/}.tmp.XXXXXX")"
-  cp "$source" "$tmp_file"
-  chmod 600 "$tmp_file" 2>/dev/null || true
-  mv "$tmp_file" "$target"
+  rm -f "$tmp_file"
+  return 1
 }
 
 import_legacy_profile_if_needed() {
@@ -359,7 +396,7 @@ import_legacy_profile_if_needed() {
   legacy="$(legacy_auth_path "$profile")"
   [[ -f "$legacy" ]] || return 0
 
-  copy_file_secure "$legacy" "$target"
+  copy_file_secure "$legacy" "$target" || return 1
   note "Imported legacy auth for '$profile' from $legacy."
 }
 
@@ -384,17 +421,36 @@ require_pi_auth() {
 }
 
 save_live_auth_as_profile() {
-  local profile="$1"
+  local profile="$1" target
 
+  if [[ "$PROFILE_LOCK_HELD" != "1" ]]; then
+    with_profile_lock save_live_auth_as_profile "$profile"
+    return
+  fi
   require_live_auth
-  copy_file_secure "$AUTH_FILE" "$(account_path "$profile")"
+  target="$(account_path "$profile")"
+  if [[ -f "$target" ]] && ! python3 - "$AUTH_FILE" "$target" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        live = json.load(f)["tokens"]["account_id"]
+    with open(sys.argv[2], encoding="utf-8") as f:
+        saved = json.load(f)["tokens"]["account_id"]
+except (OSError, ValueError, TypeError, KeyError):
+    raise SystemExit(1)
+raise SystemExit(0 if live and live == saved else 1)
+PY
+  then
+    die "Profile '$profile' belongs to a different or unreadable account; refusing overwrite. Keep the live account with '$PROGRAM save <other-name>', re-login this profile with '$PROGRAM login $profile', or delete $CURRENT_FILE if that record is stale."
+  fi
+  copy_file_secure "$AUTH_FILE" "$target"
 }
 
 restore_profile_auth() {
   local profile="$1"
   local source
 
-  import_legacy_profile_if_needed "$profile"
+  import_legacy_profile_if_needed "$profile" || return 1
   source="$(account_path "$profile")"
   [[ -f "$source" ]] || die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
   copy_file_secure "$source" "$AUTH_FILE"
@@ -493,13 +549,34 @@ save_pi_auth_from_codex_profile() {
   target="$(pi_account_path "$profile")"
   [[ -f "$source" ]] || die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
   python3 - "$source" "$target" "$PI_PROVIDER" "$TOKEN_LIFETIME_DAYS" <<'PY'
-import datetime as dt, json, os, sys, tempfile
+import base64, binascii, datetime as dt, json, os, sys, tempfile
 source, target, provider, lifetime_days = sys.argv[1:]
 with open(source, encoding="utf-8") as f:
     codex = json.load(f)
 tokens = codex.get("tokens") or {}
+
+def jwt_expiry_ms(access_token):
+    try:
+        payload = access_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return int(claims["exp"]) * 1000
+    except (
+        AttributeError,
+        binascii.Error,
+        IndexError,
+        KeyError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return None
+
 try:
-    expires = int(tokens.get("expires_at") or ((dt.datetime.now(dt.timezone.utc).timestamp() + int(lifetime_days) * 86400))) * 1000
+    expires = jwt_expiry_ms(tokens.get("access_token"))
+    if expires is None:
+        expires = int(tokens.get("expires_at") or (dt.datetime.now(dt.timezone.utc).timestamp() + int(lifetime_days) * 86400)) * 1000
 except ValueError:
     raise SystemExit("TOKEN_LIFETIME_DAYS must be an integer")
 block = {
@@ -529,12 +606,261 @@ except Exception:
 PY
 }
 
+pi_snapshot_current() {
+  local profile="$1"
+  local source saved
+  source="$(account_path "$profile")"
+  saved="$(pi_account_path "$profile")"
+  [[ -f "$source" && -f "$saved" ]] || return 1
+  python3 - "$source" "$saved" "$PI_PROVIDER" <<'PY'
+import base64, binascii, json, sys
+source, saved, provider = sys.argv[1:]
+try:
+    with open(source, encoding="utf-8") as f:
+        tokens = json.load(f)["tokens"]
+    with open(saved, encoding="utf-8") as f:
+        block = json.load(f)[provider]
+    payload = tokens["access_token"].split(".")[1]
+    expiry = int(json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))["exp"]) * 1000
+    same = (block.get("access") == tokens["access_token"] and
+            block.get("refresh") == tokens["refresh_token"] and
+            block.get("accountId") == tokens["account_id"] and
+            block.get("expires") == expiry)
+except (OSError, ValueError, TypeError, KeyError, IndexError, binascii.Error):
+    same = False
+raise SystemExit(0 if same else 1)
+PY
+}
+
+# Publica el snapshot Pi del perfil desde su Codex guardado. Ambas operaciones se
+# comprueban: 'pi sync' se invoca dentro de listas '&&' (set -e suprimido) y no
+# puede anunciar éxito si la escritura del snapshot o su publicación en el auth
+# vivo fallaron.
+sync_pi_auth_from_codex_profile() {
+  local profile="$1"
+  local update_live=0
+
+  if pi_snapshot_current "$profile"; then
+    return 0
+  fi
+  if pi_auth_matches_saved_profile "$profile"; then
+    update_live=1
+  fi
+  save_pi_auth_from_codex_profile "$profile" || {
+    stderr_note "Could not write the Pi auth snapshot for '$profile'; the live Pi auth was not touched. Re-run '$PROGRAM pi sync $profile'."
+    return 1
+  }
+  if [[ "$update_live" -eq 1 ]]; then
+    restore_pi_auth "$profile" || {
+      stderr_note "Could not publish the Pi auth snapshot for '$profile' into '$PI_AUTH_FILE'; re-run '$PROGRAM pi sync $profile' before relying on live Pi auth."
+      return 1
+    }
+    note "Updated live Pi auth for active profile '$profile'."
+  else
+    note "Updated Pi auth snapshot for inactive profile '$profile'."
+  fi
+}
+
+pi_auth_matches_saved_profile() {
+  local profile="$1"
+  local saved
+
+  saved="$(pi_account_path "$profile")"
+  [[ -f "$PI_AUTH_FILE" && -f "$saved" ]] || return 1
+  python3 - "$PI_AUTH_FILE" "$saved" "$PI_PROVIDER" <<'PY'
+import json, sys
+live_path, saved_path, provider = sys.argv[1:]
+with open(live_path, encoding="utf-8") as f:
+    live = json.load(f)
+with open(saved_path, encoding="utf-8") as f:
+    saved = json.load(f)
+raise SystemExit(0 if live.get(provider) == saved.get(provider) else 1)
+PY
+}
+
+# Un snapshot Pi mal etiquetado (otra cuenta que su snapshot Codex) dejaría las dos
+# capas desalineadas: se rechaza ANTES de tocar el auth vivo. La identidad debe
+# estar presente y legible en AMBOS: un snapshot ilegible o sin cuenta no pasa.
+assert_profile_snapshots_agree() {
+  local profile="$1"
+  local codex_id pi_id
+
+  codex_id="$(codex_account_id "$(account_path "$profile")")" \
+    || die "Profile '$profile' has no readable Codex identity (missing, malformed, or empty tokens.account_id). Re-login it with '$PROGRAM login $profile'."
+  pi_id="$(pi_account_id "$(pi_account_path "$profile")")" \
+    || die "Profile '$profile' has no readable Pi identity (missing or malformed snapshot, or empty openai-codex.accountId). Rebuild it with '$PROGRAM pi convert $profile'."
+  if [[ "$codex_id" != "$pi_id" ]]; then
+    die "Profile '$profile' is inconsistent: its Codex snapshot is on account $codex_id but its Pi snapshot is on $pi_id. Rebuild the Pi snapshot with '$PROGRAM pi convert $profile', or re-save Pi with '$PROGRAM pi save $profile' while that account is active."
+  fi
+}
+
+# El auth Pi vivo se fusiona al publicar: con JSON inválido hay que fallar ANTES de
+# cambiar Codex, o la activación quedaría a medias.
+require_readable_live_pi_auth() {
+  [[ -f "$PI_AUTH_FILE" ]] || return 0
+  python3 - "$PI_AUTH_FILE" <<'PY' || die "Live Pi auth '$PI_AUTH_FILE' is not valid JSON; refusing to switch Codex and Pi. Repair or move that file aside, then retry."
+import json, sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    json.load(f)
+PY
+}
+
+snapshot_switch_state() {
+  local dir name target
+
+  mkdir -p "$PROFILE_STORE" \
+    || die "Unable to prepare '$PROFILE_STORE' for the switch backup; no state was changed."
+  dir="$(mktemp -d "$PROFILE_STORE/switch-state.XXXXXX")" \
+    || die "Unable to create a switch backup directory in '$PROFILE_STORE'; no state was changed."
+  chmod 700 "$dir" 2>/dev/null || true
+  for name in codex.auth.json pi.auth.json current default; do
+    case "$name" in
+      codex.auth.json) target="$AUTH_FILE" ;;
+      pi.auth.json) target="$PI_AUTH_FILE" ;;
+      current) target="$CURRENT_FILE" ;;
+      default) target="$DEFAULT_FILE" ;;
+    esac
+    # La captura es completa o la activación no empieza: si faltase una copia, la
+    # restauración borraría un estado vivo que nunca se llegó a respaldar.
+    if [[ -f "$target" ]]; then
+      cp -p "$target" "$dir/$name" \
+        || { rm -rf "$dir"; die "Could not back up '$target'; no state was changed."; }
+    fi
+  done
+  printf '%s\n' "$dir"
+}
+
+restore_switch_state() {
+  local dir="$1" name target
+  local -a failed=()
+
+  for name in codex.auth.json pi.auth.json current default; do
+    case "$name" in
+      codex.auth.json) target="$AUTH_FILE" ;;
+      pi.auth.json) target="$PI_AUTH_FILE" ;;
+      current) target="$CURRENT_FILE" ;;
+      default) target="$DEFAULT_FILE" ;;
+    esac
+    if [[ -f "$dir/$name" ]]; then
+      cp -p "$dir/$name" "$target" || failed+=("$target")
+    else
+      rm -f "$target" || failed+=("$target")
+    fi
+  done
+  if [[ "${#failed[@]}" -gt 0 ]]; then
+    stderr_note "Could not restore: ${failed[*]}"
+    return 1
+  fi
+  return 0
+}
+
+# Publica el estado del perfil en Codex y Pi (y, si se pide, el perfil por defecto).
+# Cada paso se comprueba explícitamente: el llamador puede invocarnos en una
+# condición 'if' o lista '&&', donde set -e está suprimido y un fallo interno
+# pasaría inadvertido hasta dejar la activación a medias.
+publish_profile_state() {
+  local target="$1"
+  local with_default="${2:-}"
+
+  switch_profile "$target" || return 1
+  restore_pi_auth "$target" || return 1
+  if [[ "$with_default" == "--with-default" ]]; then
+    set_default_profile "$target" || return 1
+  fi
+}
+
+# Todo se valida antes del primer cambio y, si la publicación falla a mitad, se
+# restauran los estados previos (Codex, Pi, perfil actual y por defecto). Si la
+# restauración no puede completarse, el respaldo se conserva y se imprime su ruta:
+# una copia fallida a medias pudo truncar un estado vivo, y ese respaldo es la vía
+# de recuperación.
 switch_pi_profile() {
   local target="$1"
+  local with_default="${2:-}"
+  local state_dir
 
   validate_pi_auth_snapshot "$target"
-  switch_profile "$target"
-  restore_pi_auth "$target"
+  [[ -f "$(account_path "$target")" ]] \
+    || die "Unknown profile '$target'. Run '$PROGRAM login $target' first."
+  assert_profile_snapshots_agree "$target"
+  require_readable_live_pi_auth
+
+  state_dir="$(snapshot_switch_state)" || return 1
+  if ! ( publish_profile_state "$target" "$with_default" ); then
+    if restore_switch_state "$state_dir"; then
+      rm -rf "$state_dir"
+      die "Could not activate '$target' for Codex and Pi; the previous auth state was restored."
+    fi
+    stderr_note "Could not activate '$target' for Codex and Pi; the previous auth state could NOT be fully restored (see the list above); fix those files before retrying (keep this backup until repaired: $state_dir)."
+    return 1
+  fi
+  rm -rf "$state_dir"
+}
+
+codex_account_id() {
+  local path="$1"
+
+  [[ -f "$path" ]] || return 1
+  python3 - "$path" <<'PY'
+import json, sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        tokens = (json.load(f) or {}).get("tokens") or {}
+    account = tokens.get("account_id")
+except (OSError, ValueError, TypeError):
+    raise SystemExit(1)
+if not account:
+    raise SystemExit(1)
+print(account)
+PY
+}
+
+pi_account_id() {
+  local path="$1"
+
+  [[ -f "$path" ]] || return 1
+  python3 - "$path" "$PI_PROVIDER" <<'PY'
+import json, sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        block = (json.load(f) or {}).get(sys.argv[2]) or {}
+    account = block.get("accountId")
+except (OSError, ValueError, TypeError):
+    raise SystemExit(1)
+if not account:
+    raise SystemExit(1)
+print(account)
+PY
+}
+
+# 'use' activa el perfil completo: Codex y Pi. Si falta el snapshot de Pi se
+# reconstruye desde el auth de Codex para no dejar las dos capas descuadradas.
+activate_profile() {
+  local profile="$1"
+
+  if [[ "$PROFILE_LOCK_HELD" != "1" ]]; then
+    with_profile_lock activate_profile "$profile"
+    return
+  fi
+
+  import_legacy_profile_if_needed "$profile" \
+    || die "Could not import legacy auth for '$profile'."
+  [[ -f "$(account_path "$profile")" ]] \
+    || die "Unknown profile '$profile'. Run '$PROGRAM login $profile' first."
+
+  if [[ ! -f "$(pi_account_path "$profile")" ]]; then
+    save_pi_auth_from_codex_profile "$profile"
+    note "Built Pi auth snapshot for '$profile' from its Codex snapshot."
+  fi
+
+  # El perfil por defecto entra en la misma transacción: si no se puede escribir,
+  # Codex, Pi y el perfil actual también vuelven a su estado previo.
+  switch_pi_profile "$profile" --with-default || return 1
+  invalidate_managed_daemon || true
+  note "Activated '$profile' for Codex and Pi."
 }
 
 match_live_profile() {
@@ -579,24 +905,246 @@ switch_profile() {
   local live_profile=""
   local recorded_profile=""
 
-  import_legacy_profile_if_needed "$target"
+  # Sin depender de errexit: el llamador puede invocarnos dentro de una condición
+  # o de una lista '&&', donde set -e está suprimido. Cada cambio de estado se
+  # comprueba y devuelve no-cero, de modo que la transacción restaure lo previo.
+  import_legacy_profile_if_needed "$target" || return 1
 
   live_profile="$(match_live_profile || true)"
   recorded_profile="$(get_recorded_current_profile || true)"
 
   if [[ "$live_profile" == "$target" ]]; then
-    set_current_profile "$target"
+    set_current_profile "$target" || return 1
     return 0
   fi
 
   if [[ -n "$live_profile" ]]; then
-    refresh_recorded_profile_snapshot "$live_profile"
+    refresh_recorded_profile_snapshot "$live_profile" || return 1
   elif [[ -n "$recorded_profile" ]]; then
-    refresh_recorded_profile_snapshot "$recorded_profile"
+    refresh_recorded_profile_snapshot "$recorded_profile" || return 1
   fi
 
-  restore_profile_auth "$target"
-  set_current_profile "$target"
+  restore_profile_auth "$target" || return 1
+  set_current_profile "$target" || return 1
+}
+
+# El daemon gestionado de Codex (app-server) nace con la cuenta del auth vivo y
+# sirve TODAS las sesiones con ella: no relee el auth. Sin invalidarlo, tras un
+# cambio de perfil la TUI seguiría usando la cuenta anterior (incidente 29-sep:
+# auth vivo en secondary y /status con la ventana de shared).
+# La fecha del daemon frente al mtime del auth es una HEURÍSTICA de frescura, no
+# una identidad de cuenta: solo tiene resolución de segundos y un cambio de TZ o
+# una hora DST ambigua puede desviarla. Ante empate o duda se invalida, que es el
+# lado seguro. Identidad estricta: pidfd (fija el pid, sin carrera check/señal) +
+# startTicks de /proc/<pid>/stat + bootId + cmdline con 'app-server'; si no se
+# puede verificar, NO se señaliza.
+# Contrato de retorno: 0 = nada que hacer / fresco / invalidado y confirmado;
+# 1 = identidad NO verificable (python exit 11: avisa, NO señaliza; los caminos de
+# apertura de TUI ABORTAN salvo CODEX_PROFILE_ALLOW_STALE_DAEMON=1, así ninguna
+# costura ni variable relaja la guarda en silencio); 2 = obsoleto y detención NO
+# confirmada (python exit 12, o 13: señalizado pero /proc ilegible). El python
+# exit 10 (el pid vivo resulta ser un proceso ajeno: cmdline sin 'app-server')
+# sale por 0 sin señalizar: no hay daemon nuestro que invalidar.
+# Las costuras de prueba (CODEX_PROFILE_BOOT_ID_FILE, CODEX_PROFILE_TEST_STAT_
+# UNREADABLE_PID) solo pueden hacer la comprobación MÁS conservadora (un boot
+# ilegible cae en rc 1, que ya bloquea la apertura): no reducen la protección.
+invalidate_managed_daemon() {
+  local pid_file="${SHARED_CODEX_HOME}/app-server-daemon/daemon.pid"
+  local rc=0
+
+  [[ -f "$pid_file" ]] || return 0
+
+  python3 - "$pid_file" "$AUTH_FILE" <<'PY' || rc=$?
+import datetime
+import json
+import locale
+import os
+import signal
+import sys
+import time
+
+pid_file, auth_file = sys.argv[1], sys.argv[2]
+try:
+    locale.setlocale(locale.LC_TIME, "C")  # processStartTime viene en formato C
+except locale.Error:
+    pass
+
+
+def process_state(pid):
+    """'gone' (ausencia comprobada), 'zombie', 'alive' o 'unknown'.
+
+    Un zombi cuenta como terminado: su pid sigue en /proc hasta que el padre lo
+    recoja, pero ya no sirve nada. Un error de lectura distinto de la ausencia
+    (p. ej. EACCES) es estado DESCONOCIDO: no se puede declarar terminado.
+    """
+    forced = os.environ.get("CODEX_PROFILE_TEST_STAT_UNREADABLE_PID", "")
+    if forced.isdigit() and int(forced) == pid:
+        return "unknown"  # solo pruebas: fuerza la rama «no confirmado»
+    try:
+        with open("/proc/%d/stat" % pid, encoding="utf-8") as fh:
+            stat = fh.read()
+    except FileNotFoundError:
+        return "gone"
+    except OSError:
+        return "unknown"
+    return "zombie" if stat.rstrip("\n")[stat.rindex(")") + 1:].split()[0] == "Z" else "alive"
+
+
+def final_state(pid, seconds):
+    """Espera la salida y solo confirma 'gone' con ausencia/zombi comprobados."""
+    deadline = time.monotonic() + seconds
+    while True:
+        state = process_state(pid)
+        if state in ("gone", "zombie"):
+            return "gone"
+        if state == "unknown":
+            return "unknown"
+        if time.monotonic() >= deadline:
+            return "alive"
+        time.sleep(0.1)
+
+
+try:
+    with open(pid_file, encoding="utf-8") as fh:
+        data = json.load(fh) or {}
+    pid = int(data.get("pid") or 0)
+except (OSError, ValueError, TypeError):
+    raise SystemExit(11)
+if pid <= 0:
+    raise SystemExit(11)
+if not os.path.exists("/proc/%d" % pid):
+    raise SystemExit(0)  # el daemon no está: nada que invalidar
+
+# El pidfd va ANTES de verificar: fija el proceso, así el pid no puede reciclarse
+# entre la verificación y la señal (nada de kill por número tras comprobar).
+try:
+    pidfd = os.pidfd_open(pid)
+except OSError:
+    raise SystemExit(11)
+
+try:
+    with open("/proc/%d/stat" % pid, encoding="utf-8") as fh:
+        stat = fh.read()
+    # El campo 2 (comm) es el único entre paréntesis y puede tener espacios:
+    # contamos desde el campo 3, así que el 22 cae en el índice 19.
+    ticks = int(stat.rstrip("\n")[stat.rindex(")") + 1:].split()[19])
+except (OSError, ValueError, IndexError):
+    raise SystemExit(11)
+
+identity = data.get("processIdentity") or {}
+try:
+    wanted_ticks = int(identity.get("startTicks"))
+except (TypeError, ValueError):
+    raise SystemExit(11)  # sin startTicks la identidad no es verificable
+if wanted_ticks <= 0 or ticks != wanted_ticks:
+    raise SystemExit(11)
+
+want_boot = identity.get("bootId")
+if want_boot:
+    boot_file = os.environ.get("CODEX_PROFILE_BOOT_ID_FILE") or "/proc/sys/kernel/random/boot_id"
+    try:
+        with open(boot_file, encoding="utf-8") as fh:
+            here_boot = fh.read().strip()
+    except OSError:
+        here_boot = ""
+    # Sin poder leer el boot_id del kernel no se puede contrastar el del JSON:
+    # identidad no verificable => nada de señales.
+    if not here_boot or want_boot != here_boot:
+        raise SystemExit(11)
+
+try:
+    with open("/proc/%d/cmdline" % pid, "rb") as fh:
+        cmdline = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+except OSError:
+    raise SystemExit(11)
+if "app-server" not in cmdline:
+    # Pid reciclado por un proceso ajeno: no hay daemon nuestro que invalidar y a
+    # un desconocido no se le señaliza nunca (10 => rc 0, silencioso).
+    raise SystemExit(10)
+
+try:
+    born = datetime.datetime.strptime(data.get("processStartTime") or "",
+                                      "%a %b %d %H:%M:%S %Y").timestamp()
+except (ValueError, TypeError):
+    born = None  # identidad ya verificada: frescura DESCONOCIDA => se invalida
+try:
+    auth_mtime = os.stat(auth_file).st_mtime
+except OSError:
+    auth_mtime = None  # sin auth legible la frescura es dudosa: se invalida
+
+# Estrictamente posterior al auth => nació con la cuenta actual. El empate (la
+# fecha del daemon solo tiene segundos) es ambiguo y se invalida; sin fecha, la
+# frescura es desconocida y también se invalida.
+if born is not None and auth_mtime is not None and born > auth_mtime:
+    raise SystemExit(0)
+
+try:
+    signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+except ProcessLookupError:
+    raise SystemExit(0)
+except OSError:
+    raise SystemExit(12)  # no podemos señalizarlo: sigue en pie
+if final_state(pid, 2.0) == "gone":
+    raise SystemExit(0)
+
+# Escalada por el mismo pidfd: es el mismo proceso que verificamos.
+try:
+    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+except ProcessLookupError:
+    raise SystemExit(0)
+except OSError:
+    raise SystemExit(12)
+
+state = final_state(pid, 2.0)
+if state == "gone":
+    raise SystemExit(0)
+raise SystemExit(13 if state == "unknown" else 12)
+PY
+
+  case "$rc" in
+    0) return 0 ;;
+    10) return 0 ;;  # el pid vivo es un proceso ajeno: nada que invalidar
+    11) stderr_note "warning: could not verify the app-server daemon identity in $pid_file; leaving it untouched"
+        return 1 ;;
+    12) stderr_note "warning: the app-server daemon is still alive after SIGTERM/SIGKILL; a new TUI may keep using the previous account"
+        return 2 ;;
+    13) stderr_note "warning: the app-server daemon was signalled but its stop could not be confirmed (unreadable /proc state); a new TUI may keep using the previous account"
+        return 2 ;;
+    *) stderr_note "warning: could not check the app-server daemon (unexpected exit $rc)"
+       return 1 ;;
+  esac
+}
+
+canonical_path_best_effort() {
+  # realpath sin exigir que el fichero exista: sirve para comparar IDENTIDAD de
+  # fichero (enlaces y rutas equivalentes incluidos), no la forma textual.
+  python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || true
+}
+
+# El switch y la frescura del daemon se calculan sobre AUTH_FILE, pero Codex se
+# lanza con CODEX_HOME=$SHARED_CODEX_HOME y lee $SHARED_CODEX_HOME/auth.json. Si
+# AUTH_FILE apunta a OTRO fichero, la comparación puede dar FRESH mientras Codex
+# sirve el auth anterior: la garantía de cuenta no se sostiene. Se exige identidad
+# de fichero (realpath), no coincidencia textual.
+require_effective_auth_file() {
+  local declared="${AUTH_FILE:-}"
+  local effective="$SHARED_CODEX_HOME/auth.json"
+  local declared_real=""
+  local effective_real=""
+
+  if [[ "$declared" != "$effective" ]]; then
+    declared_real="$(canonical_path_best_effort "$declared")"
+    effective_real="$(canonical_path_best_effort "$effective")"
+    if [[ -z "$declared_real" || "$declared_real" != "$effective_real" ]]; then
+      if [[ "${CODEX_PROFILE_ALLOW_STALE_DAEMON:-}" == "1" ]]; then
+        stderr_note "warning: AUTH_FILE ($declared) does not resolve to the auth file Codex reads under CODEX_HOME ($effective); continuing only because CODEX_PROFILE_ALLOW_STALE_DAEMON=1"
+        return 0
+      fi
+      stderr_note "AUTH_FILE ($declared) does not resolve to the auth file Codex reads under CODEX_HOME ($effective): the profile tooling would switch one file while Codex reads another, so the account guarantee cannot be held. Unset AUTH_FILE (or point it at $effective), or set CODEX_PROFILE_ALLOW_STALE_DAEMON=1 to run anyway."
+      return 1
+    fi
+  fi
+  return 0
 }
 
 load_config() {
@@ -1239,9 +1787,7 @@ command_use() {
 
   validate_profile_name "$profile"
   ensure_dirs
-  import_legacy_profile_if_needed "$profile"
-  set_default_profile "$profile"
-  note "Default profile set to '$profile'."
+  activate_profile "$profile"
 }
 
 command_path() {
@@ -1252,13 +1798,16 @@ command_path() {
   note "$(account_path "$profile")"
 }
 
+save_and_record_profile() {
+  save_live_auth_as_profile "$1" || return 1
+  set_current_profile "$1" || return 1
+}
+
 command_save() {
   local profile="${1:-}"
 
   validate_profile_name "$profile"
-  ensure_dirs
-  save_live_auth_as_profile "$profile"
-  set_current_profile "$profile"
+  with_profile_lock save_and_record_profile "$profile" || return 1
   note "Saved live auth as '$profile'."
 }
 
@@ -1289,7 +1838,7 @@ command_login() {
     [[ -f "$source" ]] || { rm -rf "$login_home"; die "Login completed but no auth.json was created in isolated CODEX_HOME."; }
     copy_file_secure "$source" "$(account_path "$profile")"
     rm -rf "$login_home"
-    note "Saved login auth as '$profile'. Live auth unchanged. Run '$PROGRAM use $profile' to activate it."
+    note "Saved login auth as '$profile'. Live auth unchanged. Run '$PROGRAM use $profile' to activate it for Codex and Pi."
   else
     exit_status=$?
     rm -rf "$login_home"
@@ -1299,18 +1848,27 @@ command_login() {
 
 command_status() {
   local profile="${1:-}"
-  local live_profile="" saved_state="missing"
+  local live_profile="" active_profile="" saved_state="missing"
+  local default_profile="" codex_live_id="" pi_live_id="" expected_id="" unambiguous=0
+  local name codex_id pi_id listed=0
 
   ensure_dirs
 
   if [[ -n "$profile" ]]; then
     validate_profile_name "$profile"
-    import_legacy_profile_if_needed "$profile"
+    import_legacy_profile_if_needed "$profile" \
+      || stderr_note "Note: could not import legacy auth for '$profile'; reporting the saved snapshots as they are."
     [[ -f "$(account_path "$profile")" ]] && saved_state="saved"
   fi
 
-  CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" login status
+  if ! CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" login status; then
+    stderr_note "Note: '$CODEX_BIN login status' failed; continuing with the local identity checks."
+  fi
   live_profile="$(match_live_profile || true)"
+  active_profile="${live_profile:-$(get_recorded_current_profile || true)}"
+  default_profile="$(get_default_profile || true)"
+  codex_live_id="$(codex_account_id "$AUTH_FILE" || true)"
+  pi_live_id="$(pi_account_id "$PI_AUTH_FILE" || true)"
 
   if [[ -n "$profile" ]]; then
     if [[ "$saved_state" == "missing" ]]; then
@@ -1322,6 +1880,42 @@ command_status() {
     fi
   elif [[ -n "$live_profile" ]]; then
     note "Active saved profile: $live_profile"
+  fi
+
+  note "Profiles: default=${default_profile:-none} live codex=${codex_live_id:-none} live pi=${pi_live_id:-none}"
+
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    listed=1
+    codex_id="$(codex_account_id "$(account_path "$name")" || true)"
+    pi_id="$(pi_account_id "$(pi_account_path "$name")" || true)"
+    note "  $name: codex=${codex_id:-none} pi=${pi_id:-none}"
+  done < <(saved_profiles)
+  [[ "$listed" -eq 1 ]] || note "  (no saved profiles)"
+
+  if [[ -n "$active_profile" ]]; then
+    expected_id="$(pi_account_id "$(pi_account_path "$active_profile")" || true)"
+    [[ -n "$expected_id" ]] || expected_id="$(codex_account_id "$(account_path "$active_profile")" || true)"
+  fi
+
+  if [[ -n "$expected_id" && ( "$expected_id" == "$codex_live_id" || -n "$live_profile" ) ]]; then
+    unambiguous=1
+  fi
+
+  if [[ -n "$codex_live_id" && -n "$pi_live_id" && "$codex_live_id" != "$pi_live_id" ]]; then
+    stderr_note "Warning: live Pi auth ($pi_live_id) does not match live Codex auth ($codex_live_id); they are on different accounts."
+    if [[ "$unambiguous" -eq 1 ]]; then
+      stderr_note "  Use '${PROGRAM} use ${live_profile:-$active_profile}' to restore Codex and Pi auth together."
+    else
+      stderr_note "  Find the wanted profile with '${PROGRAM} list', then run '${PROGRAM} use <profile>'."
+    fi
+  elif [[ -n "$expected_id" && "$pi_live_id" != "$expected_id" ]]; then
+    stderr_note "Warning: live Pi auth (${pi_live_id:-none}) does not match active profile '$active_profile' (${expected_id})."
+    if [[ "$unambiguous" -eq 1 ]]; then
+      stderr_note "  Use '${PROGRAM} use $active_profile' to restore Codex and Pi auth together."
+    else
+      stderr_note "  Profile '$active_profile' is only recorded, not confirmed; check '${PROGRAM} list' and rerun '${PROGRAM} use <profile>'."
+    fi
   fi
 }
 
@@ -1676,14 +2270,15 @@ command_pi() {
       local profile="${1:-}"
       validate_profile_name "$profile"
       ensure_dirs
-      save_pi_auth_as_profile "$profile"
+      with_profile_lock save_pi_auth_as_profile "$profile" || return 1
       note "Saved Pi auth as '$profile'."
       ;;
     use)
       local profile="${1:-}"
       validate_profile_name "$profile"
       ensure_dirs
-      switch_pi_profile "$profile"
+      with_profile_lock switch_pi_profile "$profile" || return 1
+      invalidate_managed_daemon || true
       note "Restored Codex and Pi auth for '$profile'."
       ;;
     run)
@@ -1698,14 +2293,20 @@ command_pi() {
       local profile="${1:-}"
       validate_profile_name "$profile"
       ensure_dirs
-      save_pi_auth_from_codex_profile "$profile"
+      with_profile_lock save_pi_auth_from_codex_profile "$profile" || return 1
       note "Converted Codex auth snapshot to Pi auth for '$profile'."
+      ;;
+    sync)
+      local profile="${1:-}"
+      validate_profile_name "$profile"
+      ensure_dirs
+      with_profile_lock sync_pi_auth_from_codex_profile "$profile" || return 1
       ;;
     help|-h|--help)
       usage
       ;;
     *)
-      die "Unknown pi command '$subcommand'. Use: save, use, run, login, convert."
+      die "Unknown pi command '$subcommand'. Use: save, use, run, login, convert, sync."
       ;;
   esac
 }
@@ -1716,6 +2317,7 @@ command_pi_run() {
   local explicit_profile=0
   local selected_profile
   local exit_status=0
+  local daemon_rc=0
 
   if [[ "${1:-}" == "--" ]]; then
     profile=""
@@ -1740,7 +2342,27 @@ command_pi_run() {
     selected_profile="$(effective_run_profile "")"
   fi
 
-  switch_pi_profile "$selected_profile"
+  # H16: un AUTH_FILE desacoplado anula la garantía de cuenta (el switch escribe un
+  # fichero y Codex lee otro). Se rechaza antes de tocar nada; el escape explícito
+  # permite continuar bajo responsabilidad del operador.
+  require_effective_auth_file || return 1
+
+  if ! with_profile_lock switch_pi_profile "$selected_profile"; then
+    stderr_note "Could not switch to profile '$selected_profile'; refusing to run $PI_BIN with the previous auth."
+    return 1
+  fi
+  # Todo cambio de auth invalida el daemon; si no se pudo invalidar (rc 1
+  # identidad no verificable, rc 2 obsoleto y no detenido) esta TUI podría servir
+  # la cuenta anterior, así que no se abre salvo escape explícito.
+  invalidate_managed_daemon || daemon_rc=$?
+  if [[ "$daemon_rc" -ne 0 && "${CODEX_PROFILE_ALLOW_STALE_DAEMON:-}" != "1" ]]; then
+    if [[ "$daemon_rc" -eq 1 ]]; then
+      stderr_note "The app-server daemon identity could not be verified; it could still be serving the previous account and would not follow this profile switch; refusing to run $PI_BIN. Set CODEX_PROFILE_ALLOW_STALE_DAEMON=1 to run anyway."
+    else
+      stderr_note "The stale app-server daemon could not be stopped and would keep serving the previous account; refusing to run $PI_BIN. Set CODEX_PROFILE_ALLOW_STALE_DAEMON=1 to run anyway."
+    fi
+    return 1
+  fi
   "$PI_BIN" "${args[@]}" || exit_status=$?
   return "$exit_status"
 }
@@ -1775,6 +2397,8 @@ command_run() {
   local explicit_profile=0
   local selected_profile
   local exit_status=0
+  local daemon_rc=0
+  local auth_writer=0
 
   if [[ "${1:-}" == "--" ]]; then
     profile=""
@@ -1800,8 +2424,49 @@ command_run() {
     selected_profile="$(effective_run_profile "")"
   fi
 
-  switch_profile "$selected_profile"
+  # H16: un AUTH_FILE desacoplado anula la garantía de cuenta (el switch escribe un
+  # fichero y Codex lee otro) y solo se sostiene al abrir una TUI (exec/login/logout
+  # son one-shots o escriben el auth: la guarda los cubre en la siguiente apertura).
+  if [[ "${args[0]:-}" != "exec" && "${args[0]:-}" != "login" && "${args[0]:-}" != "logout" ]]; then
+    require_effective_auth_file || return 1
+  fi
+
+  if ! with_profile_lock switch_profile "$selected_profile"; then
+    stderr_note "Could not switch to profile '$selected_profile'; refusing to run $CODEX_BIN with the previous auth."
+    return 1
+  fi
+  # Un daemon nacido con el auth anterior seguiría sirviendo esa cuenta: se
+  # invalida SIEMPRE tras un cambio de auth, también en los one-shots 'exec' (no
+  # usan el daemon, pero lo dejarían obsoleto para cualquier TUI ya abierta).
+  invalidate_managed_daemon || daemon_rc=$?
+  # 'exec', 'login' y 'logout' no sirven cuota por el daemon: no se bloquean, solo
+  # avisa la invalidación; la guarda protege la apertura de una TUI. Bloquea rc 1
+  # (identidad no verificable) y rc 2 (obsoleto y no detenido): ninguna costura ni
+  # variable relaja la guarda en silencio, solo el escape explícito.
+  if [[ "$daemon_rc" -ne 0 && "${args[0]:-}" != "exec" && "${args[0]:-}" != "login" && "${args[0]:-}" != "logout" && "${CODEX_PROFILE_ALLOW_STALE_DAEMON:-}" != "1" ]]; then
+    if [[ "$daemon_rc" -eq 1 ]]; then
+      stderr_note "The app-server daemon identity could not be verified; it could still be serving the previous account and would not follow this profile switch; refusing to open the TUI. Set CODEX_PROFILE_ALLOW_STALE_DAEMON=1 to run anyway."
+    else
+      stderr_note "The stale app-server daemon could not be stopped and would keep serving the previous account; refusing to open the TUI. Set CODEX_PROFILE_ALLOW_STALE_DAEMON=1 to run anyway."
+    fi
+    return 1
+  fi
+  # 'run -- login' y 'run -- logout' (también el wrapper 'codex login/logout')
+  # escriben o borran el auth COMPARTIDO y pueden hacerlo DESPUÉS de la
+  # invalidación de arriba. Estos comandos NO usan exec, así que hay post-hook: se
+  # invalida otra vez al terminar, o la siguiente TUI seguiría sirviendo la cuenta
+  # anterior.
+  if [[ "${args[0]:-}" == "login" || "${args[0]:-}" == "logout" ]]; then
+    auth_writer=1
+  fi
   env CODEX_HOME="$SHARED_CODEX_HOME" "$CODEX_BIN" "${args[@]}" || exit_status=$?
+  if [[ "$auth_writer" -eq 1 ]]; then
+    daemon_rc=0
+    invalidate_managed_daemon || daemon_rc=$?
+    if [[ "$daemon_rc" -ne 0 ]]; then
+      stderr_note "warning: the app-server daemon could not be stopped after '${args[0]}'; the next TUI may keep using the previous account"
+    fi
+  fi
   return "$exit_status"
 }
 
